@@ -1,4 +1,5 @@
 /target
+/src/tools
 
 ## File system
 .DS_Store

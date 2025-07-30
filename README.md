@@ -1,6 +1,7 @@
 # java-dataset-converter-llm
 
 This package makes use of an external package called [proguard](https://github.com/Guardsquare/proguard?tab=readme-ov-file#-license) to obfuscate the java files.
+Version that will be used for this project is v7.7. The binary is not provided in the project and thus have to be downloaded manually.
 
 After obfuscating the java files, these will be converted to .jsonl files, with the following layout:
 
