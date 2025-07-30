@@ -177,7 +177,8 @@ fn main() -> std::io::Result<()> {
         "tools/proguard-7.7.0/bin", // path to proguard bin files
         "proguard-project.pro",     // ProGuard config
         "tools/cfr-0.152.jar",      // path to cfr.jar
-        "decompiled",               // decompiled obfuscated .java files
+        "decompiled",               // decompiled directory with train, validation, and test folders
+        "original_dir",             // original directory with train, validation, and test folders
     );
 
     let (train_src_dir, validation_src_dir, test_src_dir, class_dir, proguard_bin_dir, proguard_cfg, obf_jar, cfr_jar, decomp_dir) = paths;
