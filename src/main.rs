@@ -131,61 +131,67 @@ fn run_cfr(cfr_jar: &str, output_dir: &str) {
     }
 }
 
-fn read_java_files(dir: &Path) -> Vec<(String, String)> {
-    WalkDir::new(dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "java"))
-        .filter_map(|entry| {
-            let content = fs::read_to_string(entry.path()).ok()?;
-            let file_name = entry.path().file_name()?.to_string_lossy().to_string();
-            Some((file_name, content))
-        })
-        .collect()
-}
+// fn read_java_files(dir: &Path) -> Vec<(String, String)> {
+//     WalkDir::new(dir)
+//         .into_iter()
+//         .filter_map(Result::ok)
+//         .filter(|e| e.path().extension().map_or(false, |ext| ext == "java"))
+//         .filter_map(|entry| {
+//             let content = fs::read_to_string(entry.path()).ok()?;
+//             let file_name = entry.path().file_name()?.to_string_lossy().to_string();
+//             Some((file_name, content))
+//         })
+//         .collect()
+// }
 
-fn generate_jsonl(
-    original_dir: &Path,
-    decompiled_dir: &Path,
-    output_file: &str,
-) -> std::io::Result<()> {
-    let originals = read_java_files(original_dir);
-    let obfuscated = read_java_files(decompiled_dir);
-    let mut writer = BufWriter::new(File::create(output_file)?);
+// fn generate_jsonl(
+//     original_dir: &Path,
+//     decompiled_dir: &Path,
+//     output_file: &str,
+// ) -> std::io::Result<()> {
+//     let originals = read_java_files(original_dir);
+//     let obfuscated = read_java_files(decompiled_dir);
+//     let mut writer = BufWriter::new(File::create(output_file)?);
 
-    for (file_name, obf_code) in obfuscated {
-        if let Some((_, orig_code)) = originals.iter().find(|(name, _)| *name == file_name) {
-            let pair = PromptResponse {
-                prompt: obf_code.clone(),
-                response: orig_code.clone(),
-            };
-            let json_line = serde_json::to_string(&pair)?;
-            writeln!(writer, "{}", json_line)?;
-        }
-    }
+//     for (file_name, obf_code) in obfuscated {
+//         if let Some((_, orig_code)) = originals.iter().find(|(name, _)| *name == file_name) {
+//             let pair = PromptResponse {
+//                 prompt: obf_code.clone(),
+//                 response: orig_code.clone(),
+//             };
+//             let json_line = serde_json::to_string(&pair)?;
+//             writeln!(writer, "{}", json_line)?;
+//         }
+//     }
 
-    println!("✅ JSONL dataset written to: {}", output_file);
-    Ok(())
-}
+//     println!("✅ JSONL dataset written to: {}", output_file);
+//     Ok(())
+// }
 
 fn main() -> std::io::Result<()> {
     let paths = (
-        "train_src",                // original train .java files
-        "validation_src",           // original validation .java files
-        "test_src",                 // original test .java files
-        "target_classes",           // compiled .class output
-        "tools/proguard-7.7.0/bin", // path to proguard bin files
-        "proguard-project.pro",     // ProGuard config
-        "tools/cfr-0.152.jar",      // path to cfr.jar
+        "../../rep_package_previous/code/Dataset/train/java",                // original train .java files
+        "../../rep_package_previous/code/Dataset/val/java",           // original validation .java files
+        "/../../rep_package_previous/code/Dataset/test/java",                 // original test .java files
+        "target/temp_classes_dir",           // compiled .class directory
+        "src/tools/proguard-7.7.0/bin", // path to proguard bin files
+        "src/tools/proguard-7.7.0/config.pro",     // path to proguard config file
+        "src/tools/cfr-0.152.jar",      // path to cfr.jar
         "decompiled",               // decompiled directory with train, validation, and test folders
-        "original_dir",             // original directory with train, validation, and test folders
     );
 
-    let (train_src_dir, validation_src_dir, test_src_dir, class_dir, proguard_bin_dir, proguard_cfg, obf_jar, cfr_jar, decomp_dir) = paths;
+    let (train_src_dir, validation_src_dir, test_src_dir, class_dir, proguard_bin_dir, proguard_cfg, cfr_jar, decomp_dir) = paths;
 
-    compile_java(src_dir, class_dir);
+    println!("Compiling java files to class files");
+    compile_java(train_src_dir, validation_src_dir, test_src_dir, class_dir);
+
+    println!("Converting class files to jar files");
     create_jar(class_dir);
+
+    println!("Obfuscating jar files");
     run_proguard(proguard_bin_dir, proguard_cfg);
+
+    println!("Decompiling jar files to java files");
     run_cfr(cfr_jar, decomp_dir);
     // generate_jsonl(Path::new(src_dir), Path::new(decomp_dir), jsonl_out)?;
 
