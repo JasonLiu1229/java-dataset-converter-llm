@@ -1,5 +1,12 @@
+"""
+This tool builds on the research of:
+    De Keersmaeker, A. (2023). Enhancing Test Code Understandability with Machine Learning-Based Identifier Naming.
+    Master’s Thesis, University of Antwerp.
+"""
+
 import os
 import argparse
+
 
 def extract_methods_from_dataset(tests_file, dir_out):
     """
@@ -23,11 +30,21 @@ def extract_methods_from_dataset(tests_file, dir_out):
                 file_out.write("}")
             counter += 1
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Extract java methods from a dataset file.")
-    parser.add_argument("-f", "--dfile", type=str, help="Path to the dataset file containing the methods.")
-    parser.add_argument("-d", "--dir",type=str, help="Directory to save the extracted methods.")
-    
+    parser = argparse.ArgumentParser(
+        description="Extract java methods from a dataset file."
+    )
+    parser.add_argument(
+        "-f",
+        "--dfile",
+        type=str,
+        help="Path to the dataset file containing the methods.",
+    )
+    parser.add_argument(
+        "-d", "--dir", type=str, help="Directory to save the extracted methods."
+    )
+
     args = parser.parse_args()
-    
+
     extract_methods_from_dataset(args.tests_file, args.dir_out)
