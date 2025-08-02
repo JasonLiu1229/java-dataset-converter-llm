@@ -1,5 +1,6 @@
 /target
-/src/tools
+/src/tools/proguard*
+/src/tools/cfr*
 
 ## File system
 .DS_Store
