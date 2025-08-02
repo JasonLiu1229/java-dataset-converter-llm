@@ -1,7 +1,7 @@
 /target
 /src/tools/proguard*
 /src/tools/cfr*
-
+dataset/
 ## File system
 .DS_Store
 desktop.ini
