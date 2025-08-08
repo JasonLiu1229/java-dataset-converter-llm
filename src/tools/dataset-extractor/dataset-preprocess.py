@@ -44,6 +44,15 @@ def main():
     parser.add_argument(
         "-d", "--dir", type=str, help="Directory to save the extracted methods."
     )
+    parser.add_argument(
+        "-s",
+        "--size",
+        type=str,
+        required=False,
+        default="s",
+        help="Choose size with given choices: s, m, l",
+        choices=["s", "m", "l"],
+    )
 
     args = parser.parse_args()
 
