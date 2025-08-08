@@ -57,3 +57,7 @@ def main():
     args = parser.parse_args()
 
     extract_methods_from_dataset(args.tests_file, args.dir_out)
+
+
+if __name__ == "__main__":
+    main()
