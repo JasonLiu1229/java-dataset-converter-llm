@@ -16,7 +16,7 @@ fn obfuscate_code(input: &str) -> String {
         "false",
     ];
 
-    let re = Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:<[^>]+>)?)\s+([a-zA-Z_][a-zA-Z0-9_]*)(\[\s*\])?").unwrap();
+    let re = Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*(?:<[^>]+>)?(?:\[\s*\])?)\s+([a-zA-Z_][a-zA-Z0-9_]*)(\[\s*\])?").unwrap();
     let mut replacements = Vec::new();
 
     let result = re.replace_all(input, |caps: &regex::Captures| {
