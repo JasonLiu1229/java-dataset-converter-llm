@@ -15,11 +15,12 @@ LARGE = 1.0
 def extract_methods_from_dataset(tests_file, dir_out, size="l"):
     if not os.path.exists(dir_out):
         os.makedirs(dir_out)
+        print("No directory found, diretory will be manually created")
     else:
-        print(
-            "Other files found in this directory, these will be deleted during the process of extracting methods"
-        )
         for filename in os.listdir(dir_out):
+            print(
+                f'Other files found in diretory " {dir_out} ", these will be deleted during the process of extracting methods'
+            )
             file_path = os.path.join(dir_out, filename)
             try:
                 if os.path.isfile(file_path) or os.path.islink(file_path):
