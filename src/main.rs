@@ -37,11 +37,32 @@ fn obfuscate_code(input: &str) -> String {
     apply_replacements(&result, &replacements)
 }
 
+fn obfuscate_function_names(java_code: &str) -> String {
+    let re = Regex::new(
+        r"(?m)(\b(?:public|private|protected)\s+(?:static\s+)?[A-Za-z0-9_<>\[\].]+\s+)([A-Za-z_][A-Za-z0-9_]*)\s*(\([^)]*\)(?:\s*throws\s+[A-Za-z0-9_.,\s]+)?\s*\{)"
+    ).unwrap();
+
+    let mut counter = 0;
+    re.replace_all(java_code, |caps: &regex::Captures| {
+        counter += 1;
+        format!("{}func_{}{}", &caps[1], counter, &caps[3])
+    }).to_string()
+}
+
 fn apply_replacements(input: &str, replacements: &[(String, String)]) -> String {
     let mut result = input.to_string();
     for (original, replacement) in replacements {
         let re = Regex::new(&format!(r"\b{}\b", regex::escape(original))).unwrap();
-        result = re.replace_all(&result, replacement.as_str()).to_string();
+        result = re
+            .replace_all(&result, |caps: &regex::Captures| {
+                let match_str = &caps[0];
+                if !match_str.starts_with('.') && !result[caps.get(0).unwrap().end()..].starts_with('(') {
+                    replacement.clone()
+                } else {
+                    match_str.to_string()
+                }
+            })
+            .to_string();
     }
     result
 }
@@ -51,7 +72,9 @@ fn main() -> io::Result<()> {
     let output_file = "Main_obfuscated.java";
 
     let code = fs::read_to_string(input_file)?;
-    let obfuscated = obfuscate_code(&code);
+
+    let func_name_obfuscated = obfuscate_function_names(&code);
+    let obfuscated = obfuscate_code(&func_name_obfuscated);
     fs::write(output_file, obfuscated)?;
 
     println!("Obfuscation complete. Output written to {}", output_file);
