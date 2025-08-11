@@ -22,4 +22,4 @@ De Keersmaeker, A. (2023). Enhancing Test Code Understandability with Machine Le
 Master’s Thesis, University of Antwerp.
 ```
 
-It simply extracts the methods from the txt file and outputs it in a seperate directory.
+It simply extracts the methods from the txt file and outputs it in a seperate directory. It does make use of some external methods, you can simply use poetry to install these packages if not done manually. 

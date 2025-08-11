@@ -7,6 +7,8 @@ This tool builds on the research of:
 import os, shutil
 import argparse
 
+import tqdm
+
 SMALL = 0.1
 MEDIUM = 0.5
 LARGE = 1.0
@@ -17,10 +19,11 @@ def extract_methods_from_dataset(tests_file, dir_out, size="l"):
         os.makedirs(dir_out)
         print("No directory found, diretory will be manually created")
     else:
-        for filename in os.listdir(dir_out):
+        if len(os.listdir(dir_out)) > 0:
             print(
-                f'Other files found in diretory " {dir_out} ", these will be deleted during the process of extracting methods'
+                "Existing files in the output directory found, deleting files before extracting methods"
             )
+        for filename in os.listdir(dir_out):
             file_path = os.path.join(dir_out, filename)
             try:
                 if os.path.isfile(file_path) or os.path.islink(file_path):
@@ -43,18 +46,23 @@ def extract_methods_from_dataset(tests_file, dir_out, size="l"):
         file_size = len(file.readlines())
 
     with open(tests_file, "r", encoding="utf-8") as file:
-        for counter, line in enumerate(file):
-            class_name = f"TestClass{counter}"
-            with open(
-                f"{dir_out}/{class_name}.java", "w", encoding="utf-8"
-            ) as file_out:
-                # Wrap a class around the test method
-                file_out.write(f"public class {class_name} {{\n")
-                file_out.write(f"{line.strip()}\n")
-                file_out.write("}")
+        with tqdm.tqdm(
+            total=file_size * current_size, desc="Processing methods"
+        ) as pbar:
+            for counter, line in enumerate(file):
+                class_name = f"TestClass{counter}"
+                with open(
+                    f"{dir_out}/{class_name}.java", "w", encoding="utf-8"
+                ) as file_out:
+                    # Wrap a class around the test method
+                    file_out.write(f"public class {class_name} {{\n")
+                    file_out.write(f"{line.strip()}\n")
+                    file_out.write("}")
 
-            if counter > current_size * file_size:
-                break
+                pbar.update(1)
+
+                if counter > current_size * file_size:
+                    break
 
 
 def main():
