@@ -1,1 +1,2 @@
-mod obfuscator;
+pub mod obfuscator;
+pub mod cli;

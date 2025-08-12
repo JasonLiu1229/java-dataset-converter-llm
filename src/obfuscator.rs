@@ -67,7 +67,7 @@ fn apply_replacements(input: &str, replacements: &[(String, String)]) -> String 
     result
 }
 
-fn obfuscate(input_file: &str, output_file: &str) -> io::Result<()> {
+pub fn obfuscate(input_file: &str, output_file: &str) -> io::Result<()> {
     let code = fs::read_to_string(input_file)?;
     let func_name_obfuscated = obfuscate_function_names(&code);
     let obfuscated = obfuscate_code(&func_name_obfuscated);
