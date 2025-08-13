@@ -1,6 +1,7 @@
 use java_dataset_converter_llm::cli::Args;
 use java_dataset_converter_llm::helper::get_files;
 use java_dataset_converter_llm::obfuscator::obfuscate;
+use java_dataset_converter_llm::processor::generate_jsonl;
 
 use clap::Parser;
 use indicatif::ProgressBar;
@@ -52,7 +53,7 @@ fn main() -> io::Result<()> {
 
         // Skip files that already exist in the JSONL output directory
         if !jsonl_file.exists() {
-            match java_dataset_converter_llm::processor::generate_jsonL(
+            match generate_jsonl(
                 file.to_str().unwrap(),
                 output_file.to_str().unwrap(),
                 jsonl_file.to_str().unwrap(),

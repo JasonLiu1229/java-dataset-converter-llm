@@ -9,7 +9,7 @@ struct PromptResponse {
     response: String,
 }
 
-pub fn generate_jsonL(
+pub fn generate_jsonl(
     original_file: &str,
     obfuscated_file: &str,
     output_file: &str,
