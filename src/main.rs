@@ -40,28 +40,17 @@ fn main() -> io::Result<()> {
         let file_name = file.file_name().unwrap().to_str().unwrap();
         let output_file = output_dir.join(file_name);
 
-        if output_file.exists() {
-            // Skip files that already exist in the output directory, a means of pause and stop for bigger datasets
-            eprintln!(
-                "Skipping {} as it already exists in the output directory.",
-                file_name
-            );
-        } else {
+        // Skip files that already exist in the output directory
+        if !output_file.exists() {
             match obfuscate(file.to_str().unwrap(), output_file.to_str().unwrap()) {
                 Err(e) => eprintln!("Error obfuscating {}: {}", file_name, e),
                 _ => {}
             }
-        }
 
         let jsonl_file = jsonl_output_dir.join(format!("{}.jsonl", file_name));
 
-        if jsonl_file.exists() {
-            // Skip files that already exist in the JSONL output directory
-            eprintln!(
-                "Skipping {} as it already exists in the JSONL output directory.",
-                jsonl_file.display()
-            );
-        } else {
+        // Skip files that already exist in the JSONL output directory
+        if !jsonl_file.exists() {
             match java_dataset_converter_llm::processor::generate_jsonL(
                 file.to_str().unwrap(),
                 output_file.to_str().unwrap(),
@@ -70,7 +59,6 @@ fn main() -> io::Result<()> {
                 Err(e) => eprintln!("Error generating JSONL for {}: {}", file_name, e),
                 _ => {}
             }
-        }
 
         progress_bar.inc(1);
     }
