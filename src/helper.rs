@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::{PathBuf};
+use std::path::PathBuf;
 
 pub fn get_files(dir: &str, extension: &str) -> io::Result<Vec<PathBuf>> {
     let mut matching_files = Vec::new();
