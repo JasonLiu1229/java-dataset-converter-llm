@@ -6,7 +6,7 @@ use std::io;
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn obfuscate_code(input: &str) -> String {
-    let java_keywords = [
+    let java_keywords: [&'static str; 53] = [
         "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
         "const", "continue", "default", "do", "double", "else", "enum", "extends", "final",
         "finally", "float", "for", "goto", "if", "implements", "import", "instanceof", "int",
