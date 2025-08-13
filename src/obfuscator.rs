@@ -39,7 +39,7 @@ fn obfuscate_code(input: &str) -> String {
 
 fn obfuscate_function_names(java_code: &str) -> String {
     let re = Regex::new(
-        r"(?m)(\b(?:public|private|protected)\s+(?:static\s+)?[A-Za-z0-9_<>\[\].]+\s+)([A-Za-z_][A-Za-z0-9_]*)\s*(\([^)]*\)(?:\s*throws\s+[A-Za-z0-9_.,\s]+)?\s*\{)"
+        r"(?m)(\b(?:public|private|protected)\s+(?:final\s+|static\s+|synchronized\s+|abstract\s+|native\s+|strictfp\s+)*[A-Za-z0-9_<>\[\].]+\s+)([A-Za-z_][A-Za-z0-9_]*)\s*(\([^)]*\)(?:\s*throws\s+[A-Za-z0-9_.,\s]+)?\s*\{)"
     ).unwrap();
 
     let mut counter = 0;
