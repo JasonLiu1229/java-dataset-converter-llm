@@ -13,7 +13,10 @@ fn main() -> io::Result<()> {
     let args = Args::parse();
     let input_dir = Path::new(&args.input);
     let output_dir = Path::new(&args.output);
-    let jsonl_output_dir = Path::new(&args.jsonl_output);
+    let jsonl_output_dir = match &args.jsonl_output {
+        Some(dir) => Path::new(dir),
+        None => output_dir,
+    };
 
     if !input_dir.exists() {
         eprintln!("Input directory does not exist: {}", input_dir.display());
@@ -51,8 +54,8 @@ fn main() -> io::Result<()> {
 
         let jsonl_file = jsonl_output_dir.join(format!("{}.jsonl", file_name));
 
-        // Skip files that already exist in the JSONL output directory
-        if !jsonl_file.exists() {
+        // if the JSONL output directory is specified, generate JSONL files else do nothing
+        if args.jsonl_output.is_some() && !jsonl_file.exists() {
             match generate_jsonl(
                 file.to_str().unwrap(),
                 output_file.to_str().unwrap(),

@@ -18,5 +18,5 @@ pub struct Args {
     pub output: String,
 
     #[arg(short, long, help = "Output directory for the jsonL files")]
-    pub jsonl_output: String,
+    pub jsonl_output: Option<String>,
 }
