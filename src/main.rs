@@ -46,6 +46,7 @@ fn main() -> io::Result<()> {
                 Err(e) => eprintln!("Error obfuscating {}: {}", file_name, e),
                 _ => {}
             }
+        }
 
         let jsonl_file = jsonl_output_dir.join(format!("{}.jsonl", file_name));
 
@@ -59,6 +60,7 @@ fn main() -> io::Result<()> {
                 Err(e) => eprintln!("Error generating JSONL for {}: {}", file_name, e),
                 _ => {}
             }
+        }
 
         progress_bar.inc(1);
     }
