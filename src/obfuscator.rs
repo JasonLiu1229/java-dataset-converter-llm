@@ -103,7 +103,7 @@ fn apply_replacements(
 fn obfuscate_code(input: &str) -> String {
     COUNTER.store(0, Ordering::SeqCst);
 
-    let java_keywords: [&'static str; 53] = [
+    let java_keywords: [&'static str; 54] = [
         "abstract",
         "assert",
         "boolean",
@@ -157,6 +157,7 @@ fn obfuscate_code(input: &str) -> String {
         "while",
         "true",
         "false",
+        "IOException",
     ];
 
     let protected_input = find_protected_ranges(input);
@@ -240,7 +241,6 @@ fn obfuscate_code(input: &str) -> String {
 
     let protected_after = find_protected_ranges(&result_after_decl_rename);
 
-    println!("[Obfuscation] Replacements: {:?}", replacements);
     apply_replacements(&result_after_decl_rename, &replacements, &protected_after)
 }
 
