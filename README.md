@@ -24,3 +24,5 @@ It simply extracts the methods from the txt file and outputs it in a seperate di
 ## Note
 
 The obfuscation is regex based so it is not perfect. Additionally it is made for single function based methods, so files with multiple functions will not perform well and modifications should be added to make this work. In case you want to modify this, feel free to fork and credit this project.
+
+Additionally note that some parts are made with copilot, like regex and simple parsing of the code.
