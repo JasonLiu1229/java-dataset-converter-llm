@@ -10,3 +10,5 @@ regex = "1.10"
 walkdir = "2.4"
 clap = { version = "4.5.43", features = ["derive"] }
 indicatif = "0.18.0"
+tree-sitter = "0.25.10"         
+tree-sitter-java = "0.23.5"    

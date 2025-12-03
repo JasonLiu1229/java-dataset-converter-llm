@@ -3,19 +3,94 @@ use std::fs;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use tree_sitter::{Node, Parser, TreeCursor};
+use tree_sitter_java;
+
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-fn obfuscate_function_names(java_code: &str) -> String {
-    let re = Regex::new(
-        r"(?m)(\s*(?:@\w+(?:\([^)]*\))?\s*)*(?:public|private|protected)?\s*(?:static\s+|final\s+|synchronized\s+|abstract\s+|native\s+|strictfp\s+)*[A-Za-z_][A-Za-z0-9_<>\[\]]*\s+)([A-Za-z_][A-Za-z0-9_]*)\s*(\([^)]*\)(?:\s*throws\s+[A-Za-z0-9_.,\s]+)?\s*\{)"
-    ).unwrap();
+#[derive(Debug, Clone)]
+struct Replacement {
+    start: usize,
+    end: usize,
+    text: String,
+}
 
-    let mut counter = 0;
-    re.replace_all(java_code, |caps: &regex::Captures| {
-        counter += 1;
-        format!("{}func_{}{}", &caps[1], counter, &caps[3])
-    })
-    .to_string()
+fn apply_replacements(source: &str, replacements: &[Replacement]) -> String {
+    let mut result = source.to_string();
+    let mut reps: Vec<_> = replacements.to_vec();
+    reps.sort_by_key(|r| std::cmp::Reverse(r.start));
+
+    for r in reps {
+        result.replace_range(r.start..r.end, &r.text);
+    }
+
+    result
+}
+
+fn obfuscate_function_names(java_code: &str) -> String {
+    let mut parser = Parser::new();
+    let language = tree_sitter_java::LANGUAGE;
+    parser
+        .set_language(&language.into())
+        .expect("Error loading Java grammar");
+
+    let tree = match parser.parse(java_code, None) {
+        Some(t) => t,
+        None => return java_code.to_string(),
+    };
+
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+
+    let mut replacements: Vec<Replacement> = Vec::new();
+    let mut func_counter: usize = 1;
+
+    fn walk(
+        node: Node,
+        cursor: &mut TreeCursor,
+        func_counter: &mut usize,
+        replacements: &mut Vec<Replacement>,
+        source: &str,
+    ) {
+        if node.kind() == "method_declaration" {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                let start = name_node.start_byte() as usize;
+                let end = name_node.end_byte() as usize;
+                let new_name = format!("func_{}", *func_counter);
+                *func_counter += 1;
+
+                // Optionally debug:
+                // eprintln!("Renaming {} -> {}", &source[start..end], new_name);
+
+                replacements.push(Replacement {
+                    start,
+                    end,
+                    text: new_name,
+                });
+            }
+        }
+
+        if node.child_count() > 0 && cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                walk(child, cursor, func_counter, replacements, source);
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+            cursor.goto_parent();
+        }
+    }
+
+    walk(
+        root,
+        &mut cursor,
+        &mut func_counter,
+        &mut replacements,
+        java_code,
+    );
+
+    apply_replacements(java_code, &replacements)
 }
 
 fn find_protected_ranges(code: &str) -> Vec<(usize, usize)> {
@@ -72,7 +147,7 @@ fn is_in_ranges(pos: usize, ranges: &[(usize, usize)]) -> bool {
     ranges.iter().any(|&(s, e)| pos >= s && pos < e)
 }
 
-fn apply_replacements(
+fn apply_replacements_vars(
     input: &str,
     replacements: &[(String, String)],
     protected: &[(usize, usize)],
@@ -241,7 +316,7 @@ fn obfuscate_code(input: &str) -> String {
 
     let protected_after = find_protected_ranges(&result_after_decl_rename);
 
-    apply_replacements(&result_after_decl_rename, &replacements, &protected_after)
+    apply_replacements_vars(&result_after_decl_rename, &replacements, &protected_after)
 }
 
 pub fn obfuscate(input_file: &str, output_file: &str) -> io::Result<()> {
