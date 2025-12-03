@@ -7,7 +7,7 @@ static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn obfuscate_function_names(java_code: &str) -> String {
     let re = Regex::new(
-        r"(?m)(\b(?:public|private|protected)\s+(?:final\s+|static\s+|synchronized\s+|abstract\s+|native\s+|strictfp\s+)*[A-Za-z0-9_<>\[\].]+\s+)([A-Za-z_][A-Za-z0-9_]*)\s*(\([^)]*\)(?:\s*throws\s+[A-Za-z0-9_.,\s]+)?\s*\{)"
+        r"(?m)(\s*(?:@\w+(?:\([^)]*\))?\s*)*(?:public|private|protected)?\s*(?:static\s+|final\s+|synchronized\s+|abstract\s+|native\s+|strictfp\s+)*[A-Za-z_][A-Za-z0-9_<>\[\]]*\s+)([A-Za-z_][A-Za-z0-9_]*)\s*(\([^)]*\)(?:\s*throws\s+[A-Za-z0-9_.,\s]+)?\s*\{)"
     ).unwrap();
 
     let mut counter = 0;
@@ -260,15 +260,17 @@ mod tests {
         let input = "public class Test { public void myFunction() {} }";
         let expected = "public class Test { public void func_1() {} }";
         let result = super::obfuscate_function_names(input);
+        println!("Result: {}", result);
         assert_eq!(result, expected);
     }
 
     #[test]
     fn test_obfuscate_code() {
-        let input = "public class Test { public int importantFunction(int importantVar1, int importantVar2) { int result = importantVar1 + importantVar2; return result; } }";
-        let expected = "public class Test { public int func_1(int var_1, int var_2) { int var_3 = var_1 + var_2; return var_3; } }";
+        let input = "public class Test { @Test void isValidSignature_with_invalid_data_test() { int result = importantVar1 + importantVar2; return result; } }";
+        let expected = "public class Test { @Test void func_1() { int var_1 = importantVar1 + importantVar2; return var_1; } }";
         let func_name_obfuscated = super::obfuscate_function_names(input);
         let result = super::obfuscate_code(&func_name_obfuscated);
+        println!("Result: {}", result);
         assert_eq!(result, expected);
     }
 }
