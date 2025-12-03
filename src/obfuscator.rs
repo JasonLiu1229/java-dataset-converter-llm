@@ -1,3 +1,5 @@
+// Disclaimer: Code is made using GPT-5.1 and may require further review. (too little time to refactor it myself)
+
 use std::collections::HashMap;
 use std::fs;
 use std::io;
