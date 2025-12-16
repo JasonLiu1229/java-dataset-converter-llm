@@ -1,10 +1,7 @@
-# remove added folders
-Remove-Item .\..\dataset\test\java_obfuscated\* -Recurse -Force
-Remove-Item .\..\dataset\test\jsonl\* -Recurse -Force
+# Run for each directory
 
-Remove-Item .\..\dataset\train\java_obfuscated\* -Recurse -Force
-Remove-Item .\..\dataset\train\jsonl\* -Recurse -Force
+cargo run -- --input ../../out/dataset/test/parse_ok/ --output dataset\val\java_obfuscated\ --jsonl-output dataset\val\jsonl\
 
-Remove-Item .\..\dataset\val\java_obfuscated\* -Recurse -Force
-Remove-Item .\..\dataset\val\jsonl\* -Recurse -Force
+cargo run -- --input ../../out/dataset/val/parse_ok/ --output dataset\val\java_obfuscated\ --jsonl-output dataset\val\jsonl\
 
+cargo run -- --input ../../out/dataset/train/parse_ok/ --output dataset\val\java_obfuscated\ --jsonl-output dataset\val\jsonl\
