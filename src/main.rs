@@ -6,8 +6,10 @@ use java_dataset_converter_llm::processor::generate_jsonl;
 use clap::Parser;
 use indicatif::ProgressBar;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 fn is_processed(
     java_file: &Path,
@@ -28,6 +30,21 @@ fn is_processed(
     } else {
         true
     }
+}
+
+fn log_error(log_path: &Path, java_file: &Path, stage: &str, err: &dyn std::error::Error) {
+    let mut f = match OpenOptions::new().create(true).append(true).open(log_path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    let _ = writeln!(
+        f,
+        "[stage={}] file={} error={}",
+        stage,
+        java_file.display(),
+        err
+    );
 }
 
 fn main() -> io::Result<()> {
@@ -55,8 +72,9 @@ fn main() -> io::Result<()> {
         fs::create_dir_all(jsonl_output_dir)?;
     }
 
-    let java_files = get_files(input_dir.to_str().unwrap(), "java")?;
+    let error_log_path: PathBuf = output_dir.join("error.log");
 
+    let java_files = get_files(input_dir.to_str().unwrap(), "java")?;
     let total = java_files.len();
     let jsonl_enabled = args.jsonl_output.is_some();
 
@@ -67,7 +85,6 @@ fn main() -> io::Result<()> {
 
     let progress_bar = ProgressBar::new(total as u64);
     progress_bar.set_message("Processing Java files...");
-
     progress_bar.inc(already_processed as u64);
 
     for file in java_files {
@@ -81,6 +98,7 @@ fn main() -> io::Result<()> {
         if !output_file.exists() {
             if let Err(e) = obfuscate(file.to_str().unwrap(), output_file.to_str().unwrap()) {
                 eprintln!("Error obfuscating {}: {}", file_name, e);
+                log_error(&error_log_path, &file, "obfuscate", &e);
                 progress_bar.inc(1);
                 continue;
             }
@@ -95,6 +113,8 @@ fn main() -> io::Result<()> {
                     jsonl_file.to_str().unwrap(),
                 ) {
                     eprintln!("Error generating JSONL for {}: {}", file_name, e);
+                    log_error(&error_log_path, &file, "generate_jsonl", &e);
+                    // keep going
                 }
             }
         }
@@ -103,6 +123,5 @@ fn main() -> io::Result<()> {
     }
 
     progress_bar.finish_with_message("Obfuscation complete.");
-
     Ok(())
 }
