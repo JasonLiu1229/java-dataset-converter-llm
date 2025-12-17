@@ -14,15 +14,22 @@ struct Replacement {
 }
 
 fn apply_replacements(source: &str, replacements: &[Replacement]) -> String {
-    let mut result = source.to_string();
+    let mut bytes = source.as_bytes().to_vec();
+
     let mut reps: Vec<_> = replacements.to_vec();
     reps.sort_by_key(|r| std::cmp::Reverse(r.start));
 
     for r in reps {
-        result.replace_range(r.start..r.end, &r.text);
+        // Be defensive: never panic on bad spans; just skip them.
+        if r.start <= r.end && r.end <= bytes.len() {
+            bytes.splice(r.start..r.end, r.text.as_bytes().iter().copied());
+        }
     }
 
-    result
+    match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    }
 }
 
 fn obfuscate_function_names(java_code: &str) -> String {
@@ -65,7 +72,7 @@ fn obfuscate_function_names(java_code: &str) -> String {
             }
         }
 
-        if node.child_count() > 0 && cursor.goto_first_child() {
+        if cursor.goto_first_child() {
             loop {
                 let child = cursor.node();
                 walk(child, cursor, func_counter, replacements, source);
@@ -77,13 +84,7 @@ fn obfuscate_function_names(java_code: &str) -> String {
         }
     }
 
-    walk(
-        root,
-        &mut cursor,
-        &mut func_counter,
-        &mut replacements,
-        java_code,
-    );
+    walk(root, &mut cursor, &mut func_counter, &mut replacements, java_code);
 
     apply_replacements(java_code, &replacements)
 }
@@ -99,102 +100,163 @@ fn obfuscate_code(java_code: &str) -> String {
         Some(t) => t,
         None => return java_code.to_string(),
     };
+
     let root = tree.root_node();
+    let mut cursor = root.walk();
 
     let mut replacements: Vec<Replacement> = Vec::new();
 
-    let mut stack = vec![root];
-    while let Some(node) = stack.pop() {
-        if node.kind() == "method_declaration" {
-            process_method(node, java_code, &mut replacements);
-        }
+    let mut local_var_counter: usize = 1;
 
-        let mut c = node.walk();
-        for child in node.children(&mut c) {
-            stack.push(child);
-        }
-    }
+    fn obfuscate_method(
+        method: Node,
+        _cursor: &mut TreeCursor,
+        replacements: &mut Vec<Replacement>,
+        java_code: &str,
+        local_var_counter: &mut usize,
+    ) {
+        let mut var_map: HashMap<String, String> = HashMap::new();
 
-    apply_replacements(java_code, &replacements)
-}
+        let params_node = method.child_by_field_name("parameters");
 
-fn process_method(method: Node, source: &str, replacements: &mut Vec<Replacement>) {
-    let bytes = source.as_bytes();
+        if let Some(params) = params_node {
+            let mut c = params.walk();
+            if c.goto_first_child() {
+                loop {
+                    let p = c.node();
+                    if p.kind() == "formal_parameter" {
+                        if let Some(name_node) = p.child_by_field_name("name") {
+                            let start = name_node.start_byte() as usize;
+                            let end = name_node.end_byte() as usize;
+                            let name = &java_code[start..end];
+                            let new_name = format!("var_{}", *local_var_counter);
+                            *local_var_counter += 1;
 
-    let mut var_counter: usize = 1;
-    let mut var_map: HashMap<String, String> = HashMap::new();
-
-    for i in 0..method.child_count() {
-        if let Some(child) = method.child(i) {
-            if child.kind() == "formal_parameters" {
-                let mut c2 = child.walk();
-                for param in child.children(&mut c2) {
-                    if param.kind() == "formal_parameter" || param.kind() == "receiver_parameter" {
-                        if let Some(name_node) = param.child_by_field_name("name") {
-                            if let Ok(name) = name_node.utf8_text(bytes) {
-                                let name = name.to_string();
-                                if !var_map.contains_key(&name) {
-                                    let new_name = format!("var_{}", var_counter);
-                                    var_counter += 1;
-                                    var_map.insert(name, new_name);
-                                }
-                            }
+                            var_map.insert(name.to_string(), new_name.clone());
+                            replacements.push(Replacement {
+                                start,
+                                end,
+                                text: new_name,
+                            });
                         }
+                    }
+                    if !c.goto_next_sibling() {
+                        break;
                     }
                 }
             }
         }
-    }
 
-    let body_opt = method.child_by_field_name("body");
+        let body_opt = method.child_by_field_name("body");
 
-    if let Some(body) = body_opt {
-        let mut stack = vec![body];
-        while let Some(node) = stack.pop() {
-            if node.kind() == "local_variable_declaration" {
+        if let Some(body) = body_opt {
+            let mut stack = vec![body];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "local_variable_declaration" {
+                    let mut c = node.walk();
+                    if c.goto_first_child() {
+                        loop {
+                            let child = c.node();
+                            if child.kind() == "variable_declarator" {
+                                if let Some(name_node) = child.child_by_field_name("name") {
+                                    let start = name_node.start_byte() as usize;
+                                    let end = name_node.end_byte() as usize;
+                                    let name = &java_code[start..end];
+                                    let new_name = format!("var_{}", *local_var_counter);
+                                    *local_var_counter += 1;
+
+                                    var_map.insert(name.to_string(), new_name.clone());
+                                    replacements.push(Replacement {
+                                        start,
+                                        end,
+                                        text: new_name,
+                                    });
+                                }
+                            }
+
+                            if !c.goto_next_sibling() {
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 let mut c = node.walk();
-                for ch in node.children(&mut c) {
-                    if ch.kind() == "variable_declarator" {
-                        if let Some(name_node) = ch.child_by_field_name("name") {
-                            if let Ok(name) = name_node.utf8_text(bytes) {
-                                let name = name.to_string();
-                                if !var_map.contains_key(&name) {
-                                    let new_name = format!("var_{}", var_counter);
-                                    var_counter += 1;
-                                    var_map.insert(name, new_name);
-                                }
-                            }
+                if c.goto_first_child() {
+                    loop {
+                        stack.push(c.node());
+                        if !c.goto_next_sibling() {
+                            break;
                         }
                     }
                 }
             }
-
-            let mut c = node.walk();
-            for ch in node.children(&mut c) {
-                stack.push(ch);
-            }
         }
 
-        let mut stack2 = vec![body];
-        while let Some(node) = stack2.pop() {
-            if node.kind() == "identifier" {
-                if let Ok(name) = node.utf8_text(bytes) {
+        let body_opt = method.child_by_field_name("body");
+
+        if let Some(body) = body_opt {
+            let mut stack = vec![body];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "identifier" {
+                    let start = node.start_byte() as usize;
+                    let end = node.end_byte() as usize;
+                    let name = &java_code[start..end];
+
                     if let Some(new_name) = var_map.get(name) {
                         replacements.push(Replacement {
-                            start: node.start_byte() as usize,
-                            end: node.end_byte() as usize,
+                            start,
+                            end,
                             text: new_name.clone(),
                         });
                     }
                 }
-            }
 
-            let mut c = node.walk();
-            for ch in node.children(&mut c) {
-                stack2.push(ch);
+                let mut c = node.walk();
+                if c.goto_first_child() {
+                    loop {
+                        stack.push(c.node());
+                        if !c.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
+
+    fn walk_methods(
+        node: Node,
+        cursor: &mut TreeCursor,
+        replacements: &mut Vec<Replacement>,
+        java_code: &str,
+        local_var_counter: &mut usize,
+    ) {
+        if node.kind() == "method_declaration" {
+            obfuscate_method(node, cursor, replacements, java_code, local_var_counter);
+        }
+
+        if cursor.goto_first_child() {
+            loop {
+                let child = cursor.node();
+                walk_methods(child, cursor, replacements, java_code, local_var_counter);
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+            cursor.goto_parent();
+        }
+    }
+
+    walk_methods(
+        root,
+        &mut cursor,
+        &mut replacements,
+        java_code,
+        &mut local_var_counter,
+    );
+
+    apply_replacements(java_code, &replacements)
 }
 
 pub fn obfuscate(input_file: &str, output_file: &str) -> io::Result<()> {
@@ -219,9 +281,9 @@ mod tests {
 
     #[test]
     fn test_obfuscate_code() {
-        let input = "public class Test { @Test void isValidSignature_with_invalid_data_test() { int result = importantVar1 + importantVar2; return result; } }";
-        let expected = "public class Test { @Test void func_1() { int var_1 = importantVar1 + importantVar2; return var_1; } }";
+        let input = "public class Test { public void myFunction(int param1) { int x = 0; x = x + param1; } }";
         let func_name_obfuscated = super::obfuscate_function_names(input);
+        let expected = "public class Test { public void func_1(int var_1) { int var_2 = 0; var_2 = var_2 + var_1; } }";
         let result = super::obfuscate_code(&func_name_obfuscated);
         println!("Result: {}", result);
         assert_eq!(result, expected);
