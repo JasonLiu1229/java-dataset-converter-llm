@@ -9,6 +9,27 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+fn is_processed(
+    java_file: &Path,
+    output_dir: &Path,
+    jsonl_output_dir: &Path,
+    jsonl_enabled: bool,
+) -> bool {
+    let file_name = java_file.file_name().unwrap().to_str().unwrap();
+    let obfuscated = output_dir.join(file_name);
+
+    if !obfuscated.exists() {
+        return false;
+    }
+
+    if jsonl_enabled {
+        let jsonl = jsonl_output_dir.join(format!("{}.jsonl", file_name));
+        jsonl.exists()
+    } else {
+        true
+    }
+}
+
 fn main() -> io::Result<()> {
     let args = Args::parse();
     let input_dir = Path::new(&args.input);
@@ -36,33 +57,45 @@ fn main() -> io::Result<()> {
 
     let java_files = get_files(input_dir.to_str().unwrap(), "java")?;
 
-    let progress_bar = ProgressBar::new(java_files.len() as u64);
+    let total = java_files.len();
+    let jsonl_enabled = args.jsonl_output.is_some();
 
+    let already_processed = java_files
+        .iter()
+        .filter(|file| is_processed(file, output_dir, jsonl_output_dir, jsonl_enabled))
+        .count();
+
+    let progress_bar = ProgressBar::new(total as u64);
     progress_bar.set_message("Processing Java files...");
 
+    progress_bar.inc(already_processed as u64);
+
     for file in java_files {
+        if is_processed(&file, output_dir, jsonl_output_dir, jsonl_enabled) {
+            continue;
+        }
+
         let file_name = file.file_name().unwrap().to_str().unwrap();
         let output_file = output_dir.join(file_name);
 
-        // Skip files that already exist in the output directory
         if !output_file.exists() {
-            match obfuscate(file.to_str().unwrap(), output_file.to_str().unwrap()) {
-                Err(e) => eprintln!("Error obfuscating {}: {}", file_name, e),
-                _ => {}
+            if let Err(e) = obfuscate(file.to_str().unwrap(), output_file.to_str().unwrap()) {
+                eprintln!("Error obfuscating {}: {}", file_name, e);
+                progress_bar.inc(1);
+                continue;
             }
         }
 
-        let jsonl_file = jsonl_output_dir.join(format!("{}.jsonl", file_name));
-
-        // if the JSONL output directory is specified, generate JSONL files else do nothing
-        if args.jsonl_output.is_some() && !jsonl_file.exists() {
-            match generate_jsonl(
-                file.to_str().unwrap(),
-                output_file.to_str().unwrap(),
-                jsonl_file.to_str().unwrap(),
-            ) {
-                Err(e) => eprintln!("Error generating JSONL for {}: {}", file_name, e),
-                _ => {}
+        if jsonl_enabled {
+            let jsonl_file = jsonl_output_dir.join(format!("{}.jsonl", file_name));
+            if !jsonl_file.exists() {
+                if let Err(e) = generate_jsonl(
+                    file.to_str().unwrap(),
+                    output_file.to_str().unwrap(),
+                    jsonl_file.to_str().unwrap(),
+                ) {
+                    eprintln!("Error generating JSONL for {}: {}", file_name, e);
+                }
             }
         }
 
