@@ -158,9 +158,15 @@ fn is_non_variable_identifier_context(ident: Node) -> bool {
 
     if (pk == "variable_declarator" && is_field_node(ident, parent, "name"))
         || (pk == "formal_parameter" && is_field_node(ident, parent, "name"))
-        || (pk == "catch_formal_parameter" && is_field_node(ident, parent, "name"))
         || (pk == "resource" && is_field_node(ident, parent, "name"))
     {
+        return true;
+    }
+
+    // catch_formal_parameter has no "name" field — the variable is just the last
+    // plain identifier child. Mark ALL identifiers inside it as declaration sites
+    // so the generic usage-lookup does not double-replace the declaration byte range.
+    if pk == "catch_formal_parameter" {
         return true;
     }
 
@@ -204,6 +210,51 @@ fn declare_identifier(
     });
 }
 
+fn collect_class_fields(
+    node: Node,
+    java_code: &str,
+    class_scope: &mut HashMap<String, String>,
+    counter: &mut usize,
+) {
+    if node.kind() == "field_declaration" {
+        let mut c = node.walk();
+        if c.goto_first_child() {
+            loop {
+                let ch = c.node();
+                if ch.kind() == "variable_declarator" {
+                    if let Some(name_node) = ch.child_by_field_name("name") {
+                        let start = name_node.start_byte();
+                        let end = name_node.end_byte();
+                        if let Some((s, e)) =
+                            trim_to_identifier_span(java_code, start, end)
+                        {
+                            let name = &java_code[s..e];
+                            let new_name = format!("var_{}", *counter);
+                            *counter += 1;
+                            class_scope.insert(name.to_string(), new_name);
+                        }
+                    }
+                }
+                if !c.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+        // Don't recurse into field_declaration children further.
+        return;
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_class_fields(cursor.node(), java_code, class_scope, counter);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
 fn obfuscate_code(java_code: &str) -> String {
     let mut parser = Parser::new();
     let language = tree_sitter_java::LANGUAGE;
@@ -220,14 +271,76 @@ fn obfuscate_code(java_code: &str) -> String {
     let mut replacements: Vec<Replacement> = Vec::new();
     let mut local_var_counter: usize = 1;
 
+    // FIX: Pre-collect all class-level fields so method bodies can rename them.
+    let mut class_scope: HashMap<String, String> = HashMap::new();
+    collect_class_fields(root, java_code, &mut class_scope, &mut local_var_counter);
+
+    // Also emit replacements for the field declaration sites themselves.
+    // (The field names at declaration must be renamed in the output too.)
+    fn emit_field_declaration_replacements(
+        node: Node,
+        java_code: &str,
+        class_scope: &HashMap<String, String>,
+        replacements: &mut Vec<Replacement>,
+    ) {
+        if node.kind() == "field_declaration" {
+            let mut c = node.walk();
+            if c.goto_first_child() {
+                loop {
+                    let ch = c.node();
+                    if ch.kind() == "variable_declarator" {
+                        if let Some(name_node) = ch.child_by_field_name("name") {
+                            let start = name_node.start_byte();
+                            let end = name_node.end_byte();
+                            if let Some((s, e)) =
+                                trim_to_identifier_span(java_code, start, end)
+                            {
+                                let name = &java_code[s..e];
+                                if let Some(new_name) = class_scope.get(name) {
+                                    replacements.push(Replacement {
+                                        start: s,
+                                        end: e,
+                                        text: new_name.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if !c.goto_next_sibling() {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+        let mut cursor = node.walk();
+        if cursor.goto_first_child() {
+            loop {
+                emit_field_declaration_replacements(
+                    cursor.node(),
+                    java_code,
+                    class_scope,
+                    replacements,
+                );
+                if !cursor.goto_next_sibling() {
+                    break;
+                }
+            }
+        }
+    }
+
+    emit_field_declaration_replacements(root, java_code, &class_scope, &mut replacements);
+
     fn obfuscate_method(
         method: Node,
         java_code: &str,
         replacements: &mut Vec<Replacement>,
         local_var_counter: &mut usize,
+        // FIX: Accept class_scope as the bottom of the scope stack.
+        class_scope: HashMap<String, String>,
     ) {
-        // Scope stack: method scope at bottom.
-        let mut scopes: Vec<HashMap<String, String>> = vec![HashMap::new()];
+        // FIX: Seed the scope stack with class fields at the bottom.
+        let mut scopes: Vec<HashMap<String, String>> = vec![class_scope];
 
         // Parameters are in method scope.
         if let Some(params) = method.child_by_field_name("parameters") {
@@ -337,43 +450,36 @@ fn obfuscate_code(java_code: &str) -> String {
             }
 
             // Enhanced for: for (Type x : expr)
+            // The AST has no wrapper node for the variable — tree-sitter-java puts
+            // the type node(s) and the identifier directly as children of
+            // enhanced_for_statement. The variable name is the last `identifier`
+            // child that comes before the `:` token.
             if node.kind() == "enhanced_for_statement" {
-                if let Some(var) = node.child_by_field_name("variable") {
-                    // Often a formal_parameter or local_variable_declaration-ish structure
-                    if var.kind() == "formal_parameter" {
-                        if let Some(name_node) = var.child_by_field_name("name") {
-                            declare_identifier(
-                                name_node,
-                                java_code,
-                                scopes,
-                                replacements,
-                                local_var_counter,
-                            );
+                // Walk children and collect identifiers until we hit ":"
+                let mut c = node.walk();
+                let mut last_ident: Option<Node> = None;
+                if c.goto_first_child() {
+                    loop {
+                        let ch = c.node();
+                        if ch.kind() == ":" {
+                            break; // everything after this is the iterable, not the var
                         }
-                    } else if var.kind() == "local_variable_declaration" {
-                        let mut c = var.walk();
-                        if c.goto_first_child() {
-                            loop {
-                                let ch = c.node();
-                                if ch.kind() == "variable_declarator" {
-                                    if let Some(name_node) = ch.child_by_field_name("name") {
-                                        declare_identifier(
-                                            name_node,
-                                            java_code,
-                                            scopes,
-                                            replacements,
-                                            local_var_counter,
-                                        );
-                                    }
-                                }
-                                if !c.goto_next_sibling() {
-                                    break;
-                                }
-                            }
+                        if ch.kind() == "identifier" {
+                            last_ident = Some(ch);
                         }
-                    } else if var.kind() == "identifier" {
-                        declare_identifier(var, java_code, scopes, replacements, local_var_counter);
+                        if !c.goto_next_sibling() {
+                            break;
+                        }
                     }
+                }
+                if let Some(name_node) = last_ident {
+                    declare_identifier(
+                        name_node,
+                        java_code,
+                        scopes,
+                        replacements,
+                        local_var_counter,
+                    );
                 }
             }
 
@@ -383,14 +489,18 @@ fn obfuscate_code(java_code: &str) -> String {
                     if param.kind() == "catch_formal_parameter"
                         || param.kind() == "formal_parameter"
                     {
-                        if let Some(name_node) = param.child_by_field_name("name") {
-                            declare_identifier(
-                                name_node,
-                                java_code,
-                                scopes,
-                                replacements,
-                                local_var_counter,
-                            );
+                        let mut name_node: Option<Node> = None;
+                        let mut c = param.walk();
+                        if c.goto_first_child() {
+                            loop {
+                                if c.node().kind() == "identifier" {
+                                    name_node = Some(c.node());
+                                }
+                                if !c.goto_next_sibling() { break; }
+                            }
+                        }
+                        if let Some(n) = name_node {
+                            declare_identifier(n, java_code, scopes, replacements, local_var_counter);
                         }
                     }
                 }
@@ -471,15 +581,28 @@ fn obfuscate_code(java_code: &str) -> String {
         java_code: &str,
         replacements: &mut Vec<Replacement>,
         local_var_counter: &mut usize,
+        class_scope: &HashMap<String, String>,
     ) {
         if node.kind() == "method_declaration" {
-            obfuscate_method(node, java_code, replacements, local_var_counter);
+            obfuscate_method(
+                node,
+                java_code,
+                replacements,
+                local_var_counter,
+                class_scope.clone(),
+            );
         }
 
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
             loop {
-                walk_methods(cursor.node(), java_code, replacements, local_var_counter);
+                walk_methods(
+                    cursor.node(),
+                    java_code,
+                    replacements,
+                    local_var_counter,
+                    class_scope,
+                );
                 if !cursor.goto_next_sibling() {
                     break;
                 }
@@ -487,7 +610,7 @@ fn obfuscate_code(java_code: &str) -> String {
         }
     }
 
-    walk_methods(root, java_code, &mut replacements, &mut local_var_counter);
+    walk_methods(root, java_code, &mut replacements, &mut local_var_counter, &class_scope);
 
     let mut dedup: HashMap<(usize, usize), String> = HashMap::new();
     for r in replacements {
@@ -579,4 +702,250 @@ mod tests {
         assert!(result.contains("for (String"));
         assert!(result.contains("catch (Exception"));
     }
+
+    #[test]
+    fn test_class_fields_obfuscated() {
+        let input = r#"
+            public class T {
+                private int counter;
+                private String label;
+                public void m() {
+                    counter = counter + 1;
+                    label = "hello";
+                }
+            }
+        "#;
+        let func_name_obfuscated = super::obfuscate_function_names(input);
+        let result = super::obfuscate_code(&func_name_obfuscated);
+
+        assert!(!result.contains("counter"), "field 'counter' should be renamed");
+        assert!(!result.contains("label"), "field 'label' should be renamed");
+    }
+
+
+#[test]
+fn test_class_fields_and_for_loop_vars_renamed() {
+    let input = r#"
+        public class TestClass77051 {
+            private Carte carte;
+            private Noeud n1, n3, n5, n7;
+
+            @Test public void testFiltreNoeudsSimples() {
+                carte.filtreNoeudsSimples();
+                for (Arc a : carte.getPopArcs()) {
+                    if (a.getNoeudIni() == n7) {
+                        Assert.assertEquals(n1, a.getNoeudFin());
+                    }
+                }
+                for (Noeud n : carte.getPopNoeuds()) {
+                    System.out.println(n);
+                }
+            }
+        }
+    "#;
+    let step1 = super::obfuscate_function_names(input);
+    let result = super::obfuscate_code(&step1);
+
+    // Method name renamed
+    assert!(!result.contains("testFiltreNoeudsSimples"), "method name should be renamed");
+    // Class fields renamed everywhere
+    assert!(!result.contains("carte"),  "field 'carte' should be renamed");
+    assert!(!result.contains(" n1"),    "field 'n1' should be renamed");
+    assert!(!result.contains(" n7"),    "field 'n7' should be renamed");
+    // For-loop variables renamed
+    assert!(!result.contains(" a ") && !result.contains("(Arc a"),  "loop var 'a' should be renamed");
+    assert!(!result.contains(" n ") && !result.contains("(Noeud n"), "loop var 'n' should be renamed");
+    // Types must NOT be renamed
+    assert!(result.contains("Arc"),   "type 'Arc' must be preserved");
+    assert!(result.contains("Noeud"), "type 'Noeud' must be preserved");
+    // Method calls on objects must NOT be renamed
+    assert!(result.contains(".filtreNoeudsSimples()"), "invoked method name must be preserved");
+    assert!(result.contains(".getPopArcs()"),          "invoked method name must be preserved");
+    assert!(result.contains(".getNoeudIni()"),         "invoked method name must be preserved");
+}
+
+
+#[test]
+fn test_nested_enhanced_for_loops() {
+    let input = r#"
+        public class T {
+            public void m(java.util.List<java.util.List<String>> matrix) {
+                for (java.util.List<String> row : matrix) {
+                    for (String cell : row) {
+                        System.out.println(cell);
+                    }
+                }
+            }
+        }
+    "#;
+    let step1 = super::obfuscate_function_names(input);
+    let result = super::obfuscate_code(&step1);
+
+    assert!(!result.contains(" row"),  "outer loop var 'row' should be renamed");
+    assert!(!result.contains(" cell"), "inner loop var 'cell' should be renamed");
+    // The two vars should get different names
+    let var_names: Vec<&str> = result
+        .split_whitespace()
+        .filter(|w| w.starts_with("var_"))
+        .collect();
+    let unique: std::collections::HashSet<_> = var_names.iter().collect();
+    assert!(unique.len() >= 2, "outer and inner loop vars should get distinct names");
+}
+
+
+#[test]
+fn test_classic_for_loop_variable() {
+    let input = r#"
+        public class T {
+            public void m() {
+                for (int i = 0; i < 10; i++) {
+                    System.out.println(i);
+                }
+            }
+        }
+    "#;
+    let step1 = super::obfuscate_function_names(input);
+    let result = super::obfuscate_code(&step1);
+
+    assert!(!result.contains(" i ") && !result.contains("(int i"),
+        "for-init variable 'i' should be renamed");
+}
+
+#[test]
+fn test_multiple_methods_independent_scopes() {
+    let input = r#"
+        public class T {
+            public void first() {
+                int x = 1;
+                System.out.println(x);
+            }
+            public void second() {
+                int x = 2;
+                System.out.println(x);
+            }
+        }
+    "#;
+    let step1 = super::obfuscate_function_names(input);
+    let result = super::obfuscate_code(&step1);
+
+    // Both `x` variables must be gone
+    assert!(!result.contains(" x "), "local 'x' in both methods should be renamed");
+    // Method names renamed
+    assert!(!result.contains("first"),  "method 'first' should be renamed");
+    assert!(!result.contains("second"), "method 'second' should be renamed");
+}
+
+
+#[test]
+fn test_local_shadows_class_field() {
+    let input = r#"
+        public class T {
+            private int value;
+            public void m() {
+                int value = 42;       // shadows field
+                System.out.println(value);
+            }
+        }
+    "#;
+    let step1 = super::obfuscate_function_names(input);
+    let result = super::obfuscate_code(&step1);
+
+    assert!(!result.contains(" value"), "both field and local 'value' should be renamed");
+}
+
+
+#[test]
+fn test_try_with_resources_variable_renamed() {
+    let input = r#"
+        public class T {
+            public void m() throws Exception {
+                try (java.io.InputStream stream = new java.io.FileInputStream("f")) {
+                    int b = stream.read();
+                    System.out.println(b);
+                }
+            }
+        }
+    "#;
+    let step1 = super::obfuscate_function_names(input);
+    let result = super::obfuscate_code(&step1);
+
+    assert!(!result.contains(" stream"), "resource var 'stream' should be renamed");
+    assert!(!result.contains(" b "),     "local 'b' should be renamed");
+    assert!(result.contains(".read()"),  "method call '.read()' must be preserved");
+}
+
+
+#[test]
+fn test_lambda_parameter_renamed() {
+    let input = r#"
+        public class T {
+            public void m(java.util.List<String> items) {
+                items.forEach(item -> System.out.println(item));
+            }
+        }
+    "#;
+    let step1 = super::obfuscate_function_names(input);
+    let result = super::obfuscate_code(&step1);
+
+    assert!(!result.contains(" item"), "lambda param 'item' should be renamed");
+    assert!(result.contains(".forEach("), "method call '.forEach' must be preserved");
+}
+
+
+#[test]
+fn test_string_literals_untouched() {
+    let input = r#"
+        public class T {
+            public void m() {
+                int value = 1;
+                String s = "value is not a variable here";
+                System.out.println(s);
+            }
+        }
+    "#;
+    let step1 = super::obfuscate_function_names(input);
+    let result = super::obfuscate_code(&step1);
+
+    assert!(result.contains("\"value is not a variable here\""),
+        "string literal content must be preserved verbatim");
+}
+
+
+#[test]
+fn test_this_field_access_renamed() {
+    let input = r#"
+        public class T {
+            private int counter;
+            public void m() {
+                this.counter = this.counter + 1;
+            }
+        }
+    "#;
+    let step1 = super::obfuscate_function_names(input);
+    let result = super::obfuscate_code(&step1);
+
+    assert!(!result.contains(" counter ="),
+        "field declaration site 'counter' should be renamed");
+}
+
+
+#[test]
+fn test_multiple_classes_independent() {
+    let input = r#"
+        public class A {
+            private int x;
+            public void ma() { x = 1; }
+        }
+        class B {
+            private int x;
+            public void mb() { x = 2; }
+        }
+    "#;
+    let step1 = super::obfuscate_function_names(input);
+    let result = super::obfuscate_code(&step1);
+
+    assert!(!result.contains(" x "), "field 'x' in both classes should be renamed");
+    assert!(!result.contains("ma("), "method 'ma' should be renamed");
+    assert!(!result.contains("mb("), "method 'mb' should be renamed");
+}
 }
