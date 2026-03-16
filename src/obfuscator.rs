@@ -679,9 +679,6 @@ fn obfuscate_code(java_code: &str) -> String {
 
 pub fn obfuscate(input_file: &str, output_file: &str) -> io::Result<()> {
     let raw_code = fs::read_to_string(input_file)?;
-    // Repair JSON-escaping artefacts (e.g. 'Q' -> 'Q') before handing the
-    // source to tree-sitter.  A single bad char literal causes tree-sitter to
-    // emit an ERROR node that swallows the entire class, producing zero renames.
     let code = sanitize(&raw_code);
     let func_name_obfuscated = obfuscate_function_names(&code);
     let obfuscated = obfuscate_code(&func_name_obfuscated);
