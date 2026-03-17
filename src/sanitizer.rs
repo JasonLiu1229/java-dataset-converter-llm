@@ -14,7 +14,7 @@ pub fn sanitize(src: &str) -> String {
     // ── 2. Escaped single-quotes  \'  →  '  ─────────────────────────────────
     // Java char/string literals do NOT use  \'  — only  '  is valid.
     // This is the most common corruption: (byte) \'Q\'  →  (byte) 'Q'
-    out = out.replace("\\'", "'");
+    out = fix_escaped_single_quotes(&out);
 
     // ── 3. Over-escaped backslashes before double-quotes ─────────────────────
     // Java string literals use  \"  (one backslash + doublequote).
@@ -38,15 +38,136 @@ pub fn sanitize(src: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// String literal repair
+// ---------------------------------------------------------------------------
+
+/// Extract all double-quoted string literal spans from Java source.
+/// Returns a list of `(start, end)` byte offsets where `src[start..end]`
+/// is the full literal including the surrounding `"` characters.
+///
+/// The scanner respects `\"` and `\\` escape sequences so embedded quotes
+/// and backslashes do not confuse it.
+fn extract_string_literal_spans(src: &str) -> Vec<(usize, usize)> {
+    let bytes = src.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2; // skip escape pair (e.g. \" or \\)
+                } else if bytes[i] == b'"' {
+                    spans.push((start, i + 1));
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    spans
+}
+
+/// Repair corrupt string literals in `response` using the corresponding
+/// literals from `prompt` as the ground truth.
+///
+/// # Rationale
+///
+/// Obfuscation only renames identifiers — it never modifies string literal
+/// contents.  Therefore every string literal in the obfuscated prompt and
+/// the original response must be byte-for-byte identical.  When the dataset
+/// source file has been double-encoded (extra layers of backslash escaping),
+/// the response literals end up with more backslashes than the prompt ones,
+/// causing a token-count mismatch that would otherwise make the pair
+/// unusable for fine-tuning.
+///
+/// The fix is simple: wherever a response literal differs from the
+/// corresponding prompt literal, overwrite it with the prompt version.
+///
+/// # Returns
+/// * `Some(fixed_response)` — the response with all mismatched literals
+///   replaced by their prompt counterparts.
+/// * `None` — the number of string literals differs between prompt and
+///   response, meaning the corruption is too deep to recover automatically.
+pub fn fix_string_literals(prompt: &str, response: &str) -> Option<String> {
+    let p_spans = extract_string_literal_spans(prompt);
+    let r_spans = extract_string_literal_spans(response);
+
+    // If the counts differ the quote structure is broken beyond simple repair.
+    if p_spans.len() != r_spans.len() {
+        return None;
+    }
+
+    let mut result = response.to_string();
+
+    // Iterate in reverse so that replacing a span does not shift the byte
+    // offsets of spans that come earlier in the string.
+    for ((r_start, r_end), (p_start, p_end)) in
+        r_spans.iter().copied().zip(p_spans.iter().copied()).rev()
+    {
+        let r_inner = &response[r_start + 1..r_end - 1];
+        let p_inner = &prompt[p_start + 1..p_end - 1];
+        if r_inner != p_inner {
+            result.replace_range(r_start + 1..r_end - 1, p_inner);
+        }
+    }
+
+    Some(result)
+}
+
+// ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
-/// Replace  \uXXXX  (case-insensitive) with the corresponding Unicode char.
-/// Only replaces code points that are printable ASCII to avoid accidentally
-/// fixing something that is intentionally a Unicode escape inside a string
-/// literal (e.g.  "\u00e9"  should stay as-is in a string literal).
+fn fix_escaped_single_quotes(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            // Count the full run of consecutive backslashes starting at i.
+            let run_start = i;
+            while i < bytes.len() && bytes[i] == b'\\' {
+                i += 1;
+            }
+            let num_backslashes = i - run_start;
+
+            if i < bytes.len() && bytes[i] == b'\'' && num_backslashes % 2 == 1 {
+                // Odd run ending before a quote: the last backslash is escaping
+                // the quote (corruption artifact). Emit one fewer backslash and
+                // a plain quote, consuming the quote too.
+                for _ in 0..num_backslashes - 1 {
+                    out.push('\\');
+                }
+                out.push('\'');
+                i += 1; // skip the quote
+            } else {
+                // Even run, or not followed by a quote: emit all backslashes
+                // verbatim; the loop will handle whatever follows normally.
+                for _ in 0..num_backslashes {
+                    out.push('\\');
+                }
+                // i already points past the backslash run; continue normally.
+            }
+        } else {
+            let ch = src[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+
+    out
+}
+
 fn fix_json_unicode_escapes(src: &str) -> String {
-    // Fast exit: skip the allocation when no  \u  is present.
     if !src.contains("\\u") && !src.contains("\\U") {
         return src.to_string();
     }
@@ -56,7 +177,6 @@ fn fix_json_unicode_escapes(src: &str) -> String {
     let mut i = 0;
 
     while i < bytes.len() {
-        // Look for  \u  followed by exactly 4 hex digits.
         if i + 5 < bytes.len()
             && bytes[i] == b'\\'
             && (bytes[i + 1] == b'u' || bytes[i + 1] == b'U')
@@ -67,8 +187,6 @@ fn fix_json_unicode_escapes(src: &str) -> String {
         {
             let hex = &src[i + 2..i + 6];
             if let Ok(cp) = u32::from_str_radix(hex, 16) {
-                // Only substitute printable ASCII (0x20-0x7e) so we don't
-                // accidentally mangle intentional Unicode inside string literals.
                 if (0x20..=0x7e).contains(&cp) {
                     out.push(cp as u8 as char);
                     i += 6;
@@ -77,11 +195,9 @@ fn fix_json_unicode_escapes(src: &str) -> String {
             }
         }
 
-        // Copy byte as-is (multi-byte UTF-8 sequences are handled correctly
-        // because we always push the leading byte and advance by 1; the
-        // continuation bytes are just copied in subsequent iterations).
-        out.push(bytes[i] as char);
-        i += 1;
+        let ch = src[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8(); // advance by the full char width, not just 1
     }
 
     out
@@ -93,7 +209,7 @@ fn is_hex(b: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize;
+    use super::{fix_string_literals, sanitize};
 
     #[test]
     fn test_escaped_single_quote_char_literal() {
@@ -185,8 +301,6 @@ mod tests {
         assert_eq!(result, input, "non-ASCII unicode escape must be preserved");
     }
 
-    /// Full integration: the exact pattern from the failing test case in the
-    /// research dataset.
     #[test]
     fn test_failing_dataset_example() {
         let input = concat!(
@@ -209,6 +323,154 @@ mod tests {
         assert!(
             result.contains("BlockHash.Match"),
             "types must be preserved"
+        );
+    }
+
+    #[test]
+    fn test_multibyte_utf8_preserved() {
+        // `Ã¢ÂÂ` is the UTF-8 bytes for `â` rendered as Latin-1 (mojibake).
+        // The sanitizer must leave it byte-for-byte identical.
+        let input = "String s = \"DataIdentification[Ã¢ÂÂDiscoveryMetadataÃ¢ÂÂ]\";";
+        let result = sanitize(input);
+        assert_eq!(
+            result, input,
+            "multi-byte UTF-8 / mojibake sequences must not be altered"
+        );
+    }
+
+    #[test]
+    fn test_unicode_escape_fix_does_not_disturb_mojibake() {
+        let input = "String s = \\u0022Ã¢ÂÂhelloÃ¢ÂÂ\\u0022;";
+        let result = sanitize(input);
+        // The \u0022 escapes become real double-quotes; the mojibake is untouched.
+        assert_eq!(result, "String s = \"Ã¢ÂÂhelloÃ¢ÂÂ\";");
+    }
+
+    #[test]
+    fn test_real_unicode_chars_preserved() {
+        let input = "String s = \"\u{2018}hello\u{2019}\";"; // ' hello '
+        let result = sanitize(input);
+        assert_eq!(result, input, "real Unicode chars must be preserved");
+    }
+
+    #[test]
+    fn test_escaped_by_backslash_not_corrupted() {
+        let input = r#"ESCAPED BY '\\' NULL DEFINED AS '\\N'"#;
+        let result = sanitize(input);
+        assert_eq!(
+            result, input,
+            "valid Java \\\\' (escaped backslash + quote) must not be altered"
+        );
+    }
+
+    #[test]
+    fn test_token_count_mismatch_regression() {
+        let input = r#"ROW FORMAT DELIMITED FIELDS TERMINATED BY '\001' ESCAPED BY '\\' NULL DEFINED AS '\\N'"#;
+        let result = sanitize(input);
+        assert_eq!(
+            result, input,
+            "HiveHQL escape sequence must be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn test_simple_escaped_single_quote_unaffected() {
+        let input = r#"Arrays.fill(buf, (byte) \'Q\');"#;
+        let result = sanitize(input);
+        assert_eq!(result, "Arrays.fill(buf, (byte) 'Q');");
+    }
+
+    // ── fix_string_literals tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_fix_string_literals_no_corruption() {
+        // When literals already match, the response must come back unchanged.
+        let prompt = r#"public class T { @Test public void func_1() { String var_1 = "hello"; } }"#;
+        let response =
+            r#"public class T { @Test public void testFoo() { String greeting = "hello"; } }"#;
+        let fixed = fix_string_literals(prompt, response).expect("should succeed");
+        assert_eq!(fixed, response, "unchanged response must be returned as-is");
+    }
+
+    #[test]
+    fn test_fix_string_literals_mismatched_count_returns_none() {
+        // If the number of string literals differs the corruption is irrecoverable.
+        let prompt = r#"String a = "one"; String b = "two";"#;
+        let response = r#"String a = "one";"#; // missing second literal
+        assert!(
+            fix_string_literals(prompt, response).is_none(),
+            "mismatched literal count must return None"
+        );
+    }
+
+    #[test]
+    fn test_fix_string_literals_only_identifiers_differ_after_fix() {
+        // Regression test for TestClass13026 — the exact pair from the dataset
+        // that triggered the token-count mismatch bug.
+        //
+        // The original Java source uses  "\\\\"  (4 backslashes = 2 literal \\ at
+        // runtime) for the delimiter and  "\\\\one\\\\two"  for the match path.
+        // In the dataset the response was stored with the string literals
+        // double-encoded, producing far more backslashes than the prompt.
+        //
+        // After fix_string_literals the only remaining differences between
+        // prompt and response must be the renamed identifiers.
+        let prompt = concat!(
+            "public class TestClass13026 {\n",
+            "@Test public void func_1() { ",
+            "TreeDispatcher<String> var_1 = setupDispatcher(); ",
+            "var_1.setDelimiter(\"\\\\\\\\\"); ", // "\\\\" in Java source
+            "assertEquals(dispatcher.findExactMatch(\"\\\\\\\\one\\\\\\\\two\"), \"/one/two\"); ",
+            "assertNull(var_1.findExactMatch(\"/one/two\")); }\n",
+            "}",
+        );
+
+        // The response has the same string literals but with extra escaping layers
+        // (corruption from the online dataset), plus the original identifier names.
+        let response_corrupt = concat!(
+            "public class TestClass13026 {\n",
+            "@Test public void testSetDelimiter() { ",
+            "TreeDispatcher<String> dispatcher = setupDispatcher(); ",
+            "dispatcher.setDelimiter(\"\\\\\\\\\\\\\\\\\\\\\"); ", // 10 backslashes — corrupt
+            "assertEquals(dispatcher.findExactMatch(\"\\\\\\\\\\\\\\\\one\\\\\\\\\\\\\\\\two\"), \"/one/two\"); ",
+            "assertNull(dispatcher.findExactMatch(\"/one/two\")); }\n",
+            "}",
+        );
+
+        let fixed = fix_string_literals(prompt, response_corrupt)
+            .expect("literal counts match — fix must succeed");
+
+        // Token counts must now be equal.
+        let token_re = regex::Regex::new(r"[A-Za-z_]\w*|[^\w\s]|\d+|\s+").unwrap();
+        let p_count = token_re.find_iter(prompt).count();
+        let r_count = token_re.find_iter(&fixed).count();
+        assert_eq!(
+            p_count, r_count,
+            "token counts must match after fix (prompt={p_count}, response={r_count})"
+        );
+
+        // The only remaining differences must be identifier renames.
+        let obf_re = regex::Regex::new(r"^(func_\d+|var_\d+)$").unwrap();
+        let p_toks: Vec<_> = token_re.find_iter(prompt).map(|m| m.as_str()).collect();
+        let r_toks: Vec<_> = token_re.find_iter(&fixed).map(|m| m.as_str()).collect();
+        for (i, (pt, rt)) in p_toks.iter().zip(r_toks.iter()).enumerate() {
+            if pt == rt {
+                continue;
+            }
+            assert!(
+                obf_re.is_match(pt),
+                "token #{i}: unexpected non-obf diff — prompt={pt:?} response={rt:?}"
+            );
+        }
+
+        // String literals in the fixed response must equal those in the prompt.
+        assert!(
+            fixed.contains("\\\\\\\\"),
+            "fixed response must contain the correct 4-backslash delimiter literal"
+        );
+        assert!(
+            !fixed.contains("\\\\\\\\\\\\\\\\\\\\"),
+            "fixed response must NOT contain the corrupt 10-backslash literal"
         );
     }
 }

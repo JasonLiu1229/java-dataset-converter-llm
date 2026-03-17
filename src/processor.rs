@@ -1,4 +1,4 @@
-use crate::sanitizer::sanitize;
+use crate::sanitizer::{fix_string_literals, sanitize};
 use serde::Serialize;
 use std::fs;
 use std::fs::File;
@@ -22,8 +22,22 @@ pub fn generate_jsonl(
         ));
     }
 
-    let original_code = sanitize(&fs::read_to_string(original_file)?);
-    let obfuscated_code = sanitize(&fs::read_to_string(obfuscated_file)?);
+    let original_raw = fs::read_to_string(original_file)?;
+    let obfuscated_raw = fs::read_to_string(obfuscated_file)?;
+
+    let original_raw = fix_string_literals(&obfuscated_raw, &original_raw).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "String literal count mismatch between prompt and response — \
+                     cannot repair corrupt pair: {}",
+                original_file
+            ),
+        )
+    })?;
+
+    let original_code = sanitize(&original_raw);
+    let obfuscated_code = sanitize(&obfuscated_raw);
 
     if obfuscated_code.trim().is_empty() {
         return Err(std::io::Error::new(
@@ -424,6 +438,94 @@ mod tests {
         assert!(
             response.contains("result"),
             "response must contain original variable name"
+        );
+    }
+
+    /// Regression test for TestClass13026.
+    ///
+    /// The original dataset file has its string literals stored with extra
+    /// layers of backslash escaping.  In the JSONL the prompt and response
+    /// fields (after JSON decoding) contained these Java source strings:
+    ///
+    ///   prompt   setDelimiter arg: "\\"   (2 chars → 1 literal backslash)
+    ///   response setDelimiter arg: "\\\\\\\\\\\\\\\\\\\\"  (10 chars → 5 literal backslashes, corrupt)
+    ///
+    /// This caused a token-count mismatch of 95 vs 111 that made the pair
+    /// unusable.  generate_jsonl must silently repair it by copying the
+    /// prompt's string literals into the response.
+    ///
+    /// The test strings below are the exact on-disk Java source bytes that
+    /// produce those decoded JSONL values when read and serialised by serde_json.
+    #[test]
+    fn test_testclass13026_corrupt_string_literals_are_repaired() {
+        // Obfuscated (prompt) — string literals are clean.
+        // On disk the Java source contains:
+        //   setDelimiter("\\")          ← 2 backslash chars
+        //   findExactMatch("\\\\one\\\\two")  ← 4+4 backslash chars
+        let obfuscated_source = "public class TestClass13026 {\n\
+             @Test public void func_1() { \
+             TreeDispatcher<String> var_1 = setupDispatcher(); \
+             var_1.setDelimiter(\"\\\\\"); \
+             assertEquals(dispatcher.findExactMatch(\"\\\\\\\\one\\\\\\\\two\"), \"/one/two\"); \
+             assertNull(var_1.findExactMatch(\"/one/two\")); }\n\
+             }";
+
+        // Original (response) — real identifier names but corrupt string literals.
+        // On disk the Java source contains:
+        //   setDelimiter("\\\\\\\\\\")        ← 10 backslash chars (corrupt, odd-terminated)
+        //   findExactMatch("\\\\\\\\one\\\\\\\\two")  ← 8+8 backslash chars (double-encoded)
+        let original_source_corrupt = "public class TestClass13026 {\n\
+             @Test public void testSetDelimiter() { \
+             TreeDispatcher<String> dispatcher = setupDispatcher(); \
+             dispatcher.setDelimiter(\"\\\\\\\\\\\\\\\\\\\\\"); \
+             assertEquals(dispatcher.findExactMatch(\"\\\\\\\\\\\\\\\\one\\\\\\\\\\\\\\\\two\"), \"/one/two\"); \
+             assertNull(dispatcher.findExactMatch(\"/one/two\")); }\n\
+             }";
+
+        let obfuscated_file = write_temp(obfuscated_source);
+        let original_file = write_temp(original_source_corrupt);
+        let out = NamedTempFile::new().unwrap();
+        let out_path = format!("{}.jsonl", out.path().display());
+
+        super::generate_jsonl(
+            original_file.path().to_str().unwrap(),
+            obfuscated_file.path().to_str().unwrap(),
+            &out_path,
+        )
+        .expect("generate_jsonl must succeed: corrupt literals should be repaired");
+
+        let jsonl = fs::read_to_string(&out_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(jsonl.trim()).expect("output must be valid JSON");
+
+        let prompt = parsed["prompt"].as_str().unwrap();
+        let response = parsed["response"].as_str().unwrap();
+
+        // Token counts must now be equal.
+        let token_re = Regex::new(r"[A-Za-z_]\w*|[^\w\s]|\d+|\s+").unwrap();
+        let p_count = token_re.find_iter(prompt).count();
+        let r_count = token_re.find_iter(response).count();
+        assert_eq!(
+            p_count, r_count,
+            "token counts must match after repair (prompt={p_count}, response={r_count})"
+        );
+
+        // Response must carry the original identifier names.
+        assert!(
+            response.contains("testSetDelimiter"),
+            "response must contain original method name"
+        );
+        assert!(
+            response.contains("dispatcher"),
+            "response must contain original variable name"
+        );
+
+        // The repaired response must carry the same delimiter literal as the prompt.
+        // After serde_json round-trips it, the 2-backslash Java source becomes "\\\\"
+        // in the JSON string — exactly what the prompt contains.
+        assert!(
+            response.contains("\\\\"),
+            "repaired response must contain the correct delimiter literal"
         );
     }
 }
