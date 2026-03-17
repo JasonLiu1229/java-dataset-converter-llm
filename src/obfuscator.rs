@@ -677,17 +677,25 @@ fn obfuscate_code(java_code: &str) -> String {
     apply_replacements(java_code, &replacements)
 }
 
+/// Obfuscate Java source that has already been through [`sanitize_structural`],
+/// returning the result as a `String` without touching the filesystem.
+///
+/// This is the primary entry point used by `main` so that no intermediate
+/// obfuscated `.java` files need to be written to disk.
+pub fn obfuscate_str(sanitized_src: &str) -> io::Result<String> {
+    let func_name_obfuscated = obfuscate_function_names(sanitized_src);
+    Ok(obfuscate_code(&func_name_obfuscated))
+}
+
+/// File-based wrapper kept for CLI tooling that wants obfuscated `.java` files
+/// on disk (e.g. for inspection or partial re-runs).
 pub fn obfuscate(input_file: &str, output_file: &str) -> io::Result<()> {
     let raw_code = fs::read_to_string(input_file)?;
-    // Use sanitize_structural (steps 1, 2, 4, 5) only — no backslash collapsing.
-    // generate_jsonl reads this file back and runs the same sanitize_structural
-    // pass before calling fix_string_literals, so both sides are in the same
-    // state when literal counts are compared.  sanitize_backslashes (step 3)
-    // is applied later by generate_jsonl after literal repair.
-    let code = sanitize_structural(&raw_code);
-    let func_name_obfuscated = obfuscate_function_names(&code);
-    let obfuscated = obfuscate_code(&func_name_obfuscated);
-    fs::write(output_file, obfuscated)?;
+    // Use sanitize_structural only — no backslash collapsing — so the file on
+    // disk is in the same state that generate_jsonl expects to read back.
+    let sanitized = sanitize_structural(&raw_code);
+    let result = obfuscate_str(&sanitized)?;
+    fs::write(output_file, result)?;
     Ok(())
 }
 

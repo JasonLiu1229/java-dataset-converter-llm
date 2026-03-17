@@ -10,9 +10,10 @@ struct PromptResponse {
     response: String,
 }
 
-pub fn generate_jsonl(
-    original_file: &str,
-    obfuscated_file: &str,
+/// Write a JSONL training pair directly from in-memory source strings.
+pub fn generate_jsonl_from_strings(
+    original_src: &str,
+    obfuscated_src: &str,
     output_file: &str,
 ) -> std::io::Result<()> {
     if !output_file.ends_with(".jsonl") {
@@ -22,43 +23,40 @@ pub fn generate_jsonl(
         ));
     }
 
-    let original_raw = fs::read_to_string(original_file)?;
-    let obfuscated_raw = fs::read_to_string(obfuscated_file)?;
-
-    let obfuscated_p1 = sanitize_structural(&obfuscated_raw);
-    let original_p1 = sanitize_structural(&original_raw);
-
-    let original_p1 = fix_string_literals(&obfuscated_p1, &original_p1).ok_or_else(|| {
+    // ── Pipeline (phases 2 & 3) ──────────────────────────────────────────────
+    // Phase 1 (sanitize_structural) was already applied by the caller.
+    //
+    // Phase 2: fix_string_literals — copies the prompt's literal contents into
+    //   the response wherever they differ.  Obfuscation only renames identifiers,
+    //   so any content difference in a literal is dataset corruption.  Must run
+    //   BEFORE sanitize_backslashes because step 3 collapses backslash runs
+    //   context-free; corrupt runs get collapsed differently from clean ones.
+    //
+    // Phase 3: sanitize_backslashes — both sides now have identical literal
+    //   contents, so this step applies identically to both and token counts
+    //   stay in sync.
+    let original_src = fix_string_literals(obfuscated_src, original_src).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "String literal count mismatch between prompt and response — \
-                     cannot repair corrupt pair: {}",
-                original_file
-            ),
+            "String literal count mismatch between prompt and response — \
+                 cannot repair corrupt pair",
         )
     })?;
 
-    let obfuscated_code = sanitize_backslashes(&obfuscated_p1);
-    let original_code = sanitize_backslashes(&original_p1);
+    let obfuscated_code = sanitize_backslashes(obfuscated_src);
+    let original_code = sanitize_backslashes(&original_src);
 
     if obfuscated_code.trim().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "Obfuscated file '{}' is empty or whitespace-only — \
-                 the obfuscation step may not have run yet",
-                obfuscated_file
-            ),
+            "Obfuscated source is empty or whitespace-only — \
+             the obfuscation step may not have run yet",
         ));
     }
     if original_code.trim().is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!(
-                "Original file '{}' is empty or whitespace-only",
-                original_file
-            ),
+            "Original source is empty or whitespace-only",
         ));
     }
 
@@ -73,6 +71,19 @@ pub fn generate_jsonl(
     Ok(())
 }
 
+/// File-based wrapper kept for use in tests and any CLI tooling that already
+/// has both files on disk.  Applies the full three-phase sanitisation pipeline
+/// internally (reads files → sanitize_structural → fix_string_literals →
+/// sanitize_backslashes → write JSONL).
+pub fn generate_jsonl(
+    original_file: &str,
+    obfuscated_file: &str,
+    output_file: &str,
+) -> std::io::Result<()> {
+    let original_p1 = sanitize_structural(&fs::read_to_string(original_file)?);
+    let obfuscated_p1 = sanitize_structural(&fs::read_to_string(obfuscated_file)?);
+    generate_jsonl_from_strings(&original_p1, &obfuscated_p1, output_file)
+}
 #[cfg(test)]
 mod tests {
     use regex::Regex;
