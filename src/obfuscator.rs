@@ -6,7 +6,8 @@ use std::io;
 
 use tree_sitter::{Node, Parser};
 
-use crate::sanitizer::sanitize_structural;
+use crate::literal_blanker::{blank_literals, restore_literals};
+use crate::sanitizer::{sanitize_backslashes, sanitize_structural};
 
 #[derive(Debug, Clone)]
 struct Replacement {
@@ -677,14 +678,15 @@ fn obfuscate_code(java_code: &str) -> String {
     apply_replacements(java_code, &replacements)
 }
 
-/// Obfuscate Java source that has already been through [`sanitize_structural`],
-/// returning the result as a `String` without touching the filesystem.
-///
-/// This is the primary entry point used by `main` so that no intermediate
-/// obfuscated `.java` files need to be written to disk.
 pub fn obfuscate_str(sanitized_src: &str) -> io::Result<String> {
-    let func_name_obfuscated = obfuscate_function_names(sanitized_src);
-    Ok(obfuscate_code(&func_name_obfuscated))
+    // Dataset files often contain over-escaped `\\"` sequences (double-backslash + quote)
+    // from a previous JSONL encoding pass.  Normalise them to `\"` BEFORE blanking so
+    // that consume_string_literal never closes a string too early at a `\\"` boundary.
+    let src = sanitize_backslashes(sanitized_src);
+    let (blanked, store) = blank_literals(&src);
+    let func_name_obfuscated = obfuscate_function_names(&blanked);
+    let obfuscated_blanked = obfuscate_code(&func_name_obfuscated);
+    Ok(restore_literals(&obfuscated_blanked, &store))
 }
 
 /// File-based wrapper kept for CLI tooling that wants obfuscated `.java` files
@@ -1151,6 +1153,130 @@ mod tests {
         assert!(
             result.contains("System.nanoTime()"),
             "static call must be preserved"
+        );
+    }
+    #[test]
+    fn test_testclass10186_identifiers_renamed_despite_problematic_string_literals() {
+        let input = r#"public class TestClass10186 {
+@Test public void should_use_spec() throws Exception { WebServer server = SpecsServer.getServer(WebServers.findAvailablePort(), "/api", "."); server.start(); try { HttpRequest httpRequest = HttpRequest.get(server.baseUrl() + "/api/message?who=xavier"); assertThat(httpRequest.code()).isEqualTo(200); assertThat(httpRequest.body().trim()).isEqualTo("{\"message\":\"hello xavier, it's 14:33:18\"}"); } finally { server.stop(); } }
+}"#;
+
+        let result = super::obfuscate_str(input).expect("obfuscate_str must not fail");
+
+        // The method name must be renamed.
+        assert!(
+            !result.contains("should_use_spec"),
+            "method 'should_use_spec' must be renamed"
+        );
+
+        // Local variables must be renamed.
+        assert!(
+            !result.contains("WebServer server"),
+            "local 'server' declaration must be renamed"
+        );
+        assert!(
+            !result.contains("HttpRequest httpRequest"),
+            "local 'httpRequest' declaration must be renamed"
+        );
+
+        // The problematic string literal must be preserved verbatim.
+        assert!(
+            result.contains("{\\\"message\\\":\\\"hello xavier, it's 14:33:18\\\"}"),
+            "string literal contents must be preserved after obfuscation"
+        );
+
+        // The result must differ from the input (i.e. obfuscation actually ran).
+        assert_ne!(
+            result, input,
+            "output must differ from input — obfuscation must have run"
+        );
+    }
+
+    /// Regression test for TestClass10222.
+    ///
+    /// The raw `.java` file on disk contains over-escaped sequences from a
+    /// previous JSONL encoding pass:
+    ///   * `\\"` (double-backslash + quote) instead of `\"` (one backslash + quote)
+    ///   * `\'` (backslash + apostrophe) in `it\'s`
+    ///
+    /// Before this fix, `blank_literals` would hit `\\` inside the string,
+    /// treat it as one escape pair (skipping both backslashes), then treat
+    /// the following `"` as the closing quote — closing the string far too
+    /// early.  The rest of the method body was left as raw text outside any
+    /// string, tree-sitter produced ERROR nodes, and the obfuscator silently
+    /// returned the source unchanged (prompt == response in the JSONL).
+    ///
+    /// The fix: `obfuscate_str` now calls `sanitize_backslashes` before
+    /// `blank_literals`, normalising `\\"` → `\"` so every string is
+    /// consumed as one correct literal.
+    #[test]
+    fn test_testclass10222_identifiers_renamed_despite_double_escaped_backslash_quote() {
+        // Exact content of the raw .java file on disk — with `\\"` and `\'`.
+        let raw = concat!(
+            "public class TestClass10222 {\n",
+            "@Test public void should_load_spec() throws Exception {",
+            " RestxSpec spec = new RestxSpecLoader(Factory.getInstance()).load(\"cases/test/test.spec.yaml\");",
+            " assertThat(spec.getTitle()).isEqualTo(\"should say hello\");",
+            " assertThat(spec.getGiven()).hasSize(2);",
+            " assertThat(spec.getGiven().get(0)).isInstanceOf(GivenTime.class);",
+            " assertThat(((GivenTime) spec.getGiven().get(0)).getTime().getMillis())",
+            " .isEqualTo(DateTime.parse(\"2013-03-31T14:33:18.272+02:00\").getMillis());",
+            " assertThat(spec.getGiven().get(1)).isInstanceOf(GivenUUIDGenerator.class);",
+            " assertThat(((GivenUUIDGenerator) spec.getGiven().get(1)).getPlaybackUUIDs()).containsExactly(\"123456\");",
+            " assertThat(spec.getWhens()).extracting(\"method\", \"path\").containsExactly(Tuple.tuple(\"GET\", \"message/xavier\"));",
+            " assertThat(spec.getWhens()).extracting(\"then\").extracting(\"expectedCode\", \"expected\")",
+            // \\" = double-backslash+quote (dataset corruption), \' = escaped apostrophe
+            " .containsExactly(Tuple.tuple(200, \"{\\\\\"message\\\\\":\\\\\"hello xavier, it\\'s 14:33:18\\\\\"}\"));",
+            " }\n}",
+        );
+
+        // main.rs calls sanitize_structural first — replicate that here.
+        let sanitized = crate::sanitizer::sanitize_structural(raw);
+
+        // After sanitize_structural: \' → ' but \\" is still present.
+        assert!(
+            sanitized.contains("it's"),
+            "sanitize_structural must convert \\' to '"
+        );
+        assert!(
+            sanitized.contains("\\\\\""),
+            "sanitize_structural must leave \\\\ sequences for sanitize_backslashes"
+        );
+
+        let result = super::obfuscate_str(&sanitized).expect("obfuscate_str must not fail");
+
+        // Method name must be renamed.
+        assert!(
+            !result.contains("should_load_spec"),
+            "method 'should_load_spec' must be renamed to func_N"
+        );
+
+        // The only local variable declaration is `spec`.
+        assert!(
+            !result.contains("RestxSpec spec"),
+            "local 'spec' declaration must be renamed"
+        );
+
+        // Usage sites must also be renamed.
+        assert!(
+            !result.contains("spec.getTitle()"),
+            "usage 'spec.getTitle()' must use the renamed identifier"
+        );
+
+        // String literals must be preserved.
+        assert!(
+            result.contains("cases/test/test.spec.yaml"),
+            "plain string literal must be preserved"
+        );
+        assert!(
+            result.contains("should say hello"),
+            "plain string literal must be preserved"
+        );
+
+        // Sanity: output must differ from sanitized input.
+        assert_ne!(
+            result, sanitized,
+            "output must differ from sanitized input — obfuscation must have run"
         );
     }
 }
