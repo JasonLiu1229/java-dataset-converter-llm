@@ -6,7 +6,7 @@ use std::io;
 
 use tree_sitter::{Node, Parser};
 
-use crate::sanitizer::sanitize;
+use crate::sanitizer::sanitize_structural;
 
 #[derive(Debug, Clone)]
 struct Replacement {
@@ -679,7 +679,12 @@ fn obfuscate_code(java_code: &str) -> String {
 
 pub fn obfuscate(input_file: &str, output_file: &str) -> io::Result<()> {
     let raw_code = fs::read_to_string(input_file)?;
-    let code = sanitize(&raw_code);
+    // Use sanitize_structural (steps 1, 2, 4, 5) only — no backslash collapsing.
+    // generate_jsonl reads this file back and runs the same sanitize_structural
+    // pass before calling fix_string_literals, so both sides are in the same
+    // state when literal counts are compared.  sanitize_backslashes (step 3)
+    // is applied later by generate_jsonl after literal repair.
+    let code = sanitize_structural(&raw_code);
     let func_name_obfuscated = obfuscate_function_names(&code);
     let obfuscated = obfuscate_code(&func_name_obfuscated);
     fs::write(output_file, obfuscated)?;

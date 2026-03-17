@@ -1,4 +1,4 @@
-use crate::sanitizer::{fix_string_literals, sanitize};
+use crate::sanitizer::{fix_string_literals, sanitize_backslashes, sanitize_structural};
 use serde::Serialize;
 use std::fs;
 use std::fs::File;
@@ -25,7 +25,10 @@ pub fn generate_jsonl(
     let original_raw = fs::read_to_string(original_file)?;
     let obfuscated_raw = fs::read_to_string(obfuscated_file)?;
 
-    let original_raw = fix_string_literals(&obfuscated_raw, &original_raw).ok_or_else(|| {
+    let obfuscated_p1 = sanitize_structural(&obfuscated_raw);
+    let original_p1 = sanitize_structural(&original_raw);
+
+    let original_p1 = fix_string_literals(&obfuscated_p1, &original_p1).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
@@ -36,8 +39,8 @@ pub fn generate_jsonl(
         )
     })?;
 
-    let original_code = sanitize(&original_raw);
-    let obfuscated_code = sanitize(&obfuscated_raw);
+    let obfuscated_code = sanitize_backslashes(&obfuscated_p1);
+    let original_code = sanitize_backslashes(&original_p1);
 
     if obfuscated_code.trim().is_empty() {
         return Err(std::io::Error::new(

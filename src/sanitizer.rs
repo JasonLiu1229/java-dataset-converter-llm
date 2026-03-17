@@ -1,39 +1,56 @@
 // AI generated code
+
+/// Full sanitisation pipeline (steps 1–5).
+///
+/// Prefer calling [`sanitize_structural`] + [`fix_string_literals`] +
+/// [`sanitize_backslashes`] separately when processing a (prompt, response)
+/// pair, so that string-literal repair happens between the two backslash-
+/// independent phases.  See `processor::generate_jsonl` for the correct order.
 pub fn sanitize(src: &str) -> String {
+    sanitize_backslashes(&sanitize_structural(src))
+}
+
+/// Phase 1 — structural fixes that are independent of backslash counts.
+///
+/// Steps applied:
+/// 1. JSON unicode escapes  (`\u0022` → `"`, `\u0027` → `'`, …)
+/// 2. Escaped single-quotes (`\'` → `'`)
+/// 4. CRLF → LF
+/// 5. Null bytes removed
+///
+/// Step 3 (backslash normalisation before `"`) is intentionally left out so
+/// that [`fix_string_literals`] can compare literal contents before those
+/// backslash runs are mutated.
+pub fn sanitize_structural(src: &str) -> String {
     let mut out = src.to_string();
 
     // ── 1. JSON unicode escapes that leaked into the source ─────────────────
-    // e.g.  \u0027  →  '      (apostrophe / single-quote)
-    //       \u0022  →  "      (double-quote)
-    //       \u005c  →  \      (backslash)
-    //       \u003c  →  <
-    //       \u003e  →  >
-    //       \u0026  →  &
     out = fix_json_unicode_escapes(&out);
 
     // ── 2. Escaped single-quotes  \'  →  '  ─────────────────────────────────
-    // Java char/string literals do NOT use  \'  — only  '  is valid.
-    // This is the most common corruption: (byte) \'Q\'  →  (byte) 'Q'
     out = fix_escaped_single_quotes(&out);
 
-    // ── 3. Over-escaped backslashes before double-quotes ─────────────────────
-    // Java string literals use  \"  (one backslash + doublequote).
-    // After one or two rounds of JSON escaping the source may contain
-    // \\\\\\\"  (3 backslashes+quote) or  \\\\\\"  (2 backslashes+quote).
-    // Normalise both to a single  \"  (1 backslash+quote).
-    // Apply longest pattern first so a 3-backslash run is not partially fixed.
-    out = out.replace("\\\\\\\"", "\\\""); // 3 backslashes+quote → 1 backslash+quote
-    out = out.replace("\\\\\"", "\\\""); // 2 backslashes+quote → 1 backslash+quote
-
     // ── 4. CRLF  →  LF ──────────────────────────────────────────────────────
-    // tree-sitter handles CRLF fine, but normalising makes downstream diffs
-    // and line-count checks simpler.
     out = out.replace("\r\n", "\n");
 
     // ── 5. Null bytes ────────────────────────────────────────────────────────
-    // A null byte anywhere will confuse tree-sitter.
     out = out.replace('\0', "");
 
+    out
+}
+
+/// Phase 2 — over-escaped backslashes before double-quotes.
+///
+/// Step 3 of the full sanitisation pipeline:
+/// Java string literals use `\"` (one backslash + double-quote).
+/// After one or two rounds of JSON escaping the source may contain
+/// `\\\\\\\"` (3 backslashes+quote) or `\\\\\\"` (2 backslashes+quote).
+/// Normalise both to a single `\"` (1 backslash+quote).
+/// Apply longest pattern first so a 3-backslash run is not partially fixed.
+pub fn sanitize_backslashes(src: &str) -> String {
+    let mut out = src.to_string();
+    out = out.replace("\\\\\\\"", "\\\""); // 3 backslashes+quote → 1 backslash+quote
+    out = out.replace("\\\\\"", "\\\""); // 2 backslashes+quote → 1 backslash+quote
     out
 }
 
@@ -75,27 +92,6 @@ fn extract_string_literal_spans(src: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Repair corrupt string literals in `response` using the corresponding
-/// literals from `prompt` as the ground truth.
-///
-/// # Rationale
-///
-/// Obfuscation only renames identifiers — it never modifies string literal
-/// contents.  Therefore every string literal in the obfuscated prompt and
-/// the original response must be byte-for-byte identical.  When the dataset
-/// source file has been double-encoded (extra layers of backslash escaping),
-/// the response literals end up with more backslashes than the prompt ones,
-/// causing a token-count mismatch that would otherwise make the pair
-/// unusable for fine-tuning.
-///
-/// The fix is simple: wherever a response literal differs from the
-/// corresponding prompt literal, overwrite it with the prompt version.
-///
-/// # Returns
-/// * `Some(fixed_response)` — the response with all mismatched literals
-///   replaced by their prompt counterparts.
-/// * `None` — the number of string literals differs between prompt and
-///   response, meaning the corruption is too deep to recover automatically.
 pub fn fix_string_literals(prompt: &str, response: &str) -> Option<String> {
     let p_spans = extract_string_literal_spans(prompt);
     let r_spans = extract_string_literal_spans(response);

@@ -2,6 +2,7 @@ use java_dataset_converter_llm::cli::Args;
 use java_dataset_converter_llm::helper::get_files;
 use java_dataset_converter_llm::obfuscator::obfuscate;
 use java_dataset_converter_llm::processor::generate_jsonl;
+use java_dataset_converter_llm::sanitizer::sanitize_structural;
 
 use clap::Parser;
 use indicatif::ProgressBar;
@@ -95,10 +96,42 @@ fn main() -> io::Result<()> {
         let file_name = file.file_name().unwrap().to_str().unwrap();
         let output_file = output_dir.join(file_name);
 
+        // Sanitize the original source (structural pass only) before obfuscating.
+        // This ensures tree-sitter sees clean input (resolved unicode escapes,
+        // fixed single-quote escapes, normalised line endings) so identifier
+        // boundaries are detected correctly.  We write the sanitized version to
+        // a temp path and pass that to obfuscate() and generate_jsonl(), so all
+        // three stages — sanitize, obfuscate, JSONL generation — operate on the
+        // same byte sequence.
+        let sanitized_original_path = output_dir.join(format!("{}.sanitized.java", file_name));
+
         if !output_file.exists() {
-            if let Err(e) = obfuscate(file.to_str().unwrap(), output_file.to_str().unwrap()) {
+            // Write sanitized original so obfuscate() reads clean input.
+            let raw = match fs::read_to_string(&file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading {}: {}", file_name, e);
+                    log_error(&error_log_path, &file, "read", &e);
+                    progress_bar.inc(1);
+                    continue;
+                }
+            };
+            let sanitized = sanitize_structural(&raw);
+            if let Err(e) = fs::write(&sanitized_original_path, &sanitized) {
+                eprintln!("Error writing sanitized source for {}: {}", file_name, e);
+                log_error(&error_log_path, &file, "sanitize_write", &e);
+                progress_bar.inc(1);
+                continue;
+            }
+
+            if let Err(e) = obfuscate(
+                sanitized_original_path.to_str().unwrap(),
+                output_file.to_str().unwrap(),
+            ) {
                 eprintln!("Error obfuscating {}: {}", file_name, e);
                 log_error(&error_log_path, &file, "obfuscate", &e);
+                // Clean up temp file on failure.
+                let _ = fs::remove_file(&sanitized_original_path);
                 progress_bar.inc(1);
                 continue;
             }
@@ -107,8 +140,20 @@ fn main() -> io::Result<()> {
         if jsonl_enabled {
             let jsonl_file = jsonl_output_dir.join(format!("{}.jsonl", file_name));
             if !jsonl_file.exists() {
+                // Use the sanitized original (not the raw file) so generate_jsonl
+                // sees the same byte sequence the obfuscator worked on.
+                let original_for_jsonl = if sanitized_original_path.exists() {
+                    sanitized_original_path.clone()
+                } else {
+                    // Already processed in a previous run — re-sanitize on the fly.
+                    let raw = fs::read_to_string(&file).unwrap_or_default();
+                    let sanitized = sanitize_structural(&raw);
+                    let _ = fs::write(&sanitized_original_path, &sanitized);
+                    sanitized_original_path.clone()
+                };
+
                 if let Err(e) = generate_jsonl(
-                    file.to_str().unwrap(),
+                    original_for_jsonl.to_str().unwrap(),
                     output_file.to_str().unwrap(),
                     jsonl_file.to_str().unwrap(),
                 ) {
