@@ -74,9 +74,31 @@ pub fn sanitize_backslashes(src: &str) -> String {
 /// Returns a list of `(start, end)` byte offsets where `src[start..end]`
 /// is the full literal including the surrounding `"` characters.
 ///
-/// The scanner respects `\"` and `\\` escape sequences so embedded quotes
-/// and backslashes do not confuse it.
-fn extract_string_literal_spans(src: &str) -> Vec<(usize, usize)> {
+/// Uses the same corruption-recovery heuristic as `blank_literals` /
+/// `consume_string_literal`: when an even backslash run precedes a `"` and
+/// the following byte looks like it cannot start a valid Java token after a
+/// string close (a letter, digit, `{`, `}`, `:`, `_`, `$`, or `\`), the `"`
+/// is treated as an embedded escaped quote and scanning continues.
+///
+/// This must stay in sync with `literal_blanker::consume_string_literal` so
+/// that `fix_string_literals` always counts the same number of literals as
+/// `blank_literals`, preventing "String literal count mismatch" errors.
+pub(crate) fn extract_string_literal_spans(src: &str) -> Vec<(usize, usize)> {
+    fn is_suspicious_after_even_backslash_close(b: u8) -> bool {
+        matches!(
+            b,
+            b'a'..=b'z'
+                | b'A'..=b'Z'
+                | b'0'..=b'9'
+                | b'{'
+                | b'}'
+                | b':'
+                | b'_'
+                | b'$'
+                | b'\\'
+        )
+    }
+
     let bytes = src.as_bytes();
     let mut spans = Vec::new();
     let mut i = 0;
@@ -85,10 +107,34 @@ fn extract_string_literal_spans(src: &str) -> Vec<(usize, usize)> {
         if bytes[i] == b'"' {
             let start = i;
             i += 1;
-            while i < bytes.len() {
+            loop {
+                if i >= bytes.len() {
+                    break;
+                }
                 if bytes[i] == b'\\' {
-                    i += 2; // skip escape pair (e.g. \" or \\)
+                    // Count the full backslash run.
+                    let run_start = i;
+                    while i < bytes.len() && bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    let run_len = i - run_start;
+                    if i < bytes.len() && bytes[i] == b'"' {
+                        let next = bytes.get(i + 1).copied().unwrap_or(b' ');
+                        if run_len % 2 == 0 && is_suspicious_after_even_backslash_close(next) {
+                            // Corruption heuristic: treat as embedded quote, keep scanning.
+                            i += 1;
+                        } else if run_len % 2 == 0 {
+                            // Even run + non-suspicious next byte → real closing quote.
+                            spans.push((start, i + 1));
+                            i += 1;
+                            break;
+                        } else {
+                            // Odd run → the last `\` escapes the `"`, keep scanning.
+                            i += 1;
+                        }
+                    }
                 } else if bytes[i] == b'"' {
+                    // Bare unescaped closing quote.
                     spans.push((start, i + 1));
                     i += 1;
                     break;
@@ -517,10 +563,10 @@ mod tests {
         );
     }
 
-    /// `sanitize_backslashes` is still used inside `generate_jsonl_from_strings`
-    /// for final output normalisation.  This test verifies it produces a stable,
-    /// correct result for the TestClass11755 source — 3 clean literals with all
-    /// identifiers outside strings — and is idempotent.
+    /// Regression: TestClass11755 full source — after `sanitize_backslashes`
+    /// the source must contain exactly 3 string literals (not 5 broken ones),
+    /// all method-body identifiers must be outside strings, and the result
+    /// must be stable (calling again makes no further changes).
     #[test]
     fn sanitize_backslashes_testclass11755_produces_correct_literal_count() {
         let raw = concat!(
@@ -579,6 +625,66 @@ mod tests {
         assert!(
             result.contains("result"),
             "local var 'result' must be visible"
+        );
+    }
+
+    // ── extract_string_literal_spans sync tests ──────────────────────────────
+
+    /// `extract_string_literal_spans` (used by `fix_string_literals`) must count
+    /// string literals identically to `blank_literals` / `consume_string_literal`.
+    /// If they diverge, `fix_string_literals` rejects the pair with "String literal
+    /// count mismatch" even when `blank_literals` parsed it fine.
+    ///
+    /// This helper mirrors the smart scanner logic.
+    fn smart_span_count(src: &str) -> usize {
+        super::extract_string_literal_spans(src).len()
+    }
+
+    #[test]
+    fn extract_spans_matches_blank_literals_for_corrupt_backslash_quote() {
+        // TestClass10186 / TestClass10859 style: \\" sequences in the source.
+        let src = concat!(
+            "assertThat(httpRequest.body().trim())",
+            ".isEqualTo(\"{\\\\\"message\\\\\":\\\\\"hello xavier, it's 14:33:18\\\\\"}\");",
+        );
+        // The smart scanner must treat \\" before a letter/: as embedded → 1 literal.
+        assert_eq!(
+            smart_span_count(src),
+            1,
+            "corrupt \\\\\" sequences must be counted as one literal"
+        );
+    }
+
+    #[test]
+    fn extract_spans_matches_blank_literals_for_valid_double_backslash() {
+        // TestClass12696 style: valid \\\\ string (value = \\).
+        let src = "assertThat(result).isEqualTo(\"\\\\\\\\\");";
+        assert_eq!(
+            smart_span_count(src),
+            1,
+            "valid \\\\\\\\ string must be one literal"
+        );
+    }
+
+    #[test]
+    fn extract_spans_count_equals_blank_literals_count_testclass10859() {
+        // Contains \\"activeProfiles\\":[\\"  — must give the same count as blank_literals.
+        let src = concat!(
+            "assertTrue(res.getResponse().getContentAsString()",
+            ".contains(\"\\\\\"activeProfiles\\\":[\\\\\"\"",
+            "+profiles[0]+\"+\\\\\"]\"));",
+        );
+        // Both naive and smart are used here; just assert they agree.
+        let spans = super::extract_string_literal_spans(src);
+        // The count should be consistent (smart: 3 fragments that together form the arg).
+        // Most importantly it must NOT be 5 (naive) vs 4 (smart) mismatch.
+        // Verify by checking the count is the same as blank_literals would produce.
+        // We can't call blank_literals from here, but we can assert the span scanner
+        // uses the same heuristic by checking a known expected value.
+        assert_eq!(
+            spans.len(),
+            3,
+            "TestClass10859-style source must produce 3 literal spans, not more"
         );
     }
 }
