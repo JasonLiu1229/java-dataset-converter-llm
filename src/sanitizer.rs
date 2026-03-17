@@ -43,14 +43,26 @@ pub fn sanitize_structural(src: &str) -> String {
 ///
 /// Step 3 of the full sanitisation pipeline:
 /// Java string literals use `\"` (one backslash + double-quote).
-/// After one or two rounds of JSON escaping the source may contain
-/// `\\\\\\\"` (3 backslashes+quote) or `\\\\\\"` (2 backslashes+quote).
-/// Normalise both to a single `\"` (1 backslash+quote).
-/// Apply longest pattern first so a 3-backslash run is not partially fixed.
+/// After one or more rounds of JSON escaping the source may contain
+/// arbitrarily deep backslash runs before a quote — e.g. `\\\\\"` (4
+/// backslashes+quote from two encoding passes).  A single replacement
+/// pass only reduces the run by 2–3 backslashes, leaving `\\"` which
+/// still breaks `blank_literals` / `consume_string_literal`.
+///
+/// We therefore repeat the replacement until the output stabilises so
+/// that every `\"` in the result has exactly one preceding backslash,
+/// regardless of how many encoding passes the source went through.
 pub fn sanitize_backslashes(src: &str) -> String {
     let mut out = src.to_string();
-    out = out.replace("\\\\\\\"", "\\\""); // 3 backslashes+quote → 1 backslash+quote
-    out = out.replace("\\\\\"", "\\\""); // 2 backslashes+quote → 1 backslash+quote
+    loop {
+        let next = out
+            .replace("\\\\\\\"", "\\\"") // 3 backslashes+quote → 1 backslash+quote
+            .replace("\\\\\"", "\\\""); // 2 backslashes+quote → 1 backslash+quote
+        if next == out {
+            break;
+        }
+        out = next;
+    }
     out
 }
 
@@ -467,6 +479,106 @@ mod tests {
         assert!(
             !fixed.contains("\\\\\\\\\\\\\\\\\\\\"),
             "fixed response must NOT contain the corrupt 10-backslash literal"
+        );
+    }
+
+    // ── sanitize_backslashes multi-pass regression ───────────────────────────
+
+    /// Regression: TestClass11755.
+    ///
+    /// The raw dataset file had been through more than one JSONL encoding pass,
+    /// leaving 4-backslash runs before quotes (`\\\\"`).  A single replacement
+    /// pass reduces `\\\\"` → `\\"` (still over-escaped), causing
+    /// `consume_string_literal` to close the string too early and spill the
+    /// method body outside any string — tree-sitter then produces ERROR nodes
+    /// and the obfuscator returns the source unchanged.
+    ///
+    /// `sanitize_backslashes` must loop until stable so that 4+ backslash runs
+    /// are fully reduced to a single `\"`.
+    #[test]
+    fn sanitize_backslashes_fully_reduces_four_backslash_run() {
+        // 4 backslashes + quote — needs two passes to reach \"
+        let input = "\\\\\\\\\""; // Rust: 4 backslashes + quote
+        let result = super::sanitize_backslashes(input);
+        assert_eq!(
+            result, "\\\"",
+            "4-backslash+quote must be fully reduced to \\\" in one call"
+        );
+    }
+
+    #[test]
+    fn sanitize_backslashes_fully_reduces_six_backslash_run() {
+        // 6 backslashes + quote — needs three passes
+        let input = "\\\\\\\\\\\\\""; // 6 backslashes + quote
+        let result = super::sanitize_backslashes(input);
+        assert_eq!(
+            result, "\\\"",
+            "6-backslash+quote must be fully reduced to \\\" in one call"
+        );
+    }
+
+    /// `sanitize_backslashes` is still used inside `generate_jsonl_from_strings`
+    /// for final output normalisation.  This test verifies it produces a stable,
+    /// correct result for the TestClass11755 source — 3 clean literals with all
+    /// identifiers outside strings — and is idempotent.
+    #[test]
+    fn sanitize_backslashes_testclass11755_produces_correct_literal_count() {
+        let raw = concat!(
+            "public class TestClass11755 {\n",
+            "@Test public void testString() throws IOException {",
+            " final ByteArrayOutputStream baos = new ByteArrayOutputStream();",
+            " final AJsonSerHelper ser = new AJsonSerHelper(baos);",
+            // first arg: 4-backslash run before the closing quote of \"{}[]\"
+            " ser.writeStringLiteral(\"abcäöü\\\\r\\\\n\\\\t \\\\\\\\\\\"{}[]\");",
+            " final String result = new String(baos.toByteArray(), \"utf-8\");",
+            // second string arg: even deeper backslash run
+            " assertEquals(\"\\\"abcäöü\\\\\\\\u000d\\\\\\\\u000a\\\\\\\\u0009 \\\\\\\\\\\\\\\\\\\\\\\\\\\"{}[]\\\"\", result);",
+            " }\n}",
+        );
+
+        let result = super::sanitize_backslashes(raw);
+
+        // Must be idempotent — calling again must not change anything.
+        assert_eq!(
+            super::sanitize_backslashes(&result),
+            result,
+            "sanitize_backslashes must be idempotent"
+        );
+
+        // Count string literals using the same logic as consume_string_literal.
+        let bytes = result.as_bytes();
+        let mut count = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                count += 1;
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        assert_eq!(
+            count, 3,
+            "must find exactly 3 string literals after normalisation, found {}",
+            count
+        );
+
+        // Identifiers must be outside strings (not swallowed by a runaway literal).
+        assert!(result.contains("baos"), "identifier 'baos' must be visible");
+        assert!(result.contains("ser"), "identifier 'ser' must be visible");
+        assert!(
+            result.contains("result"),
+            "local var 'result' must be visible"
         );
     }
 }

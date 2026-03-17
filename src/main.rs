@@ -2,7 +2,7 @@ use java_dataset_converter_llm::cli::Args;
 use java_dataset_converter_llm::helper::get_files;
 use java_dataset_converter_llm::obfuscator::obfuscate_str;
 use java_dataset_converter_llm::processor::generate_jsonl_from_strings;
-use java_dataset_converter_llm::sanitizer::{sanitize_backslashes, sanitize_structural};
+use java_dataset_converter_llm::sanitizer::sanitize_structural;
 
 use clap::Parser;
 use indicatif::ProgressBar;
@@ -33,8 +33,19 @@ fn log_error(log_path: &Path, java_file: &Path, stage: &str, err: &dyn std::erro
     );
 }
 
+/// Normalise a raw `.java` source string.
+///
+/// Only structural fixes are applied here (JSON unicode escapes, `\'` → `'`,
+/// CRLF → LF, null bytes).  Backslash normalisation is intentionally NOT done
+/// here: `sanitize_backslashes` is a blind text replace that cannot distinguish
+/// valid Java `"\\\\"` (a string whose value is `\\`) from the corrupted form
+/// `"\\"` produced by over-encoding.  Applying it here would destroy valid
+/// sources.  Both sides of the JSONL pair (`sanitized_original` and the output
+/// of `obfuscate_str`) go through `sanitize_structural` only, so their string
+/// literal structure is always identical and `fix_string_literals` never
+/// produces a count mismatch.
 fn full_sanitize(raw: &str) -> String {
-    sanitize_backslashes(&sanitize_structural(raw))
+    sanitize_structural(raw)
 }
 
 fn main() -> io::Result<()> {
@@ -120,21 +131,36 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::full_sanitize;
 
+    /// `full_sanitize` must apply `sanitize_structural` (fixing `\'` → `'`,
+    /// JSON unicode escapes, CRLF, null bytes) but must NOT apply
+    /// `sanitize_backslashes`.  A blind backslash replace cannot distinguish
+    /// valid Java `"\\\\"` (value = `\\`) from the over-encoded form `"\\"`,
+    /// so applying it here would corrupt valid sources and cause literal-count
+    /// mismatches between the original and obfuscated sides.
     #[test]
-    fn full_sanitize_normalises_double_escaped_backslash_quote() {
-        // Raw file has \\" (double-backslash + quote) from a JSONL encoding pass.
-        let raw = r#"String s = "{\\"key\\":\\"value\\"}";"#;
+    fn full_sanitize_does_not_alter_valid_backslash_pairs() {
+        // Valid Java: string whose value is two backslashes.
+        // full_sanitize must leave this byte-for-byte identical.
+        let raw = r#"assertThat(result).isEqualTo("\\\\");"#;
         let result = full_sanitize(raw);
-        // After full_sanitize, \\" must be collapsed to \" — one backslash + quote.
+        assert_eq!(
+            result, raw,
+            "full_sanitize must not alter a valid \\\\\\\\ string literal"
+        );
+    }
+
+    /// `full_sanitize` must still fix `\\'` → `'` (escaped apostrophe artifact).
+    #[test]
+    fn full_sanitize_fixes_escaped_apostrophe() {
+        let raw = "Arrays.fill(buf, (byte) \\'Q\\');";
+        let result = full_sanitize(raw);
         assert!(
-            !result.contains("\\\\\""),
-            "full_sanitize must collapse \\\\\"-sequences: got {:?}",
-            result
+            result.contains("'Q'"),
+            "full_sanitize must convert \\' to '"
         );
         assert!(
-            result.contains("\\\""),
-            "full_sanitize must preserve \\\" after collapsing: got {:?}",
-            result
+            !result.contains("\\'"),
+            "full_sanitize must remove all \\' sequences"
         );
     }
 }

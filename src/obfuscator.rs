@@ -7,7 +7,7 @@ use std::io;
 use tree_sitter::{Node, Parser};
 
 use crate::literal_blanker::{blank_literals, restore_literals};
-use crate::sanitizer::{sanitize_backslashes, sanitize_structural};
+use crate::sanitizer::sanitize_structural;
 
 #[derive(Debug, Clone)]
 struct Replacement {
@@ -679,11 +679,14 @@ fn obfuscate_code(java_code: &str) -> String {
 }
 
 pub fn obfuscate_str(sanitized_src: &str) -> io::Result<String> {
-    // Dataset files often contain over-escaped `\\"` sequences (double-backslash + quote)
-    // from a previous JSONL encoding pass.  Normalise them to `\"` BEFORE blanking so
-    // that consume_string_literal never closes a string too early at a `\\"` boundary.
-    let src = sanitize_backslashes(sanitized_src);
-    let (blanked, store) = blank_literals(&src);
+    // `blank_literals` / `consume_string_literal` already handles all backslash
+    // escape sequences correctly by skipping pairs (i += 2 on every `\`).
+    // Calling `sanitize_backslashes` here would be a blind text replace that
+    // cannot distinguish a valid `"\\\\"` (string value = `\\`) from the
+    // over-encoded `"\\"`, and would destroy the former.  Both sides of the
+    // JSONL pair are produced from the same `sanitized_src`, so their literal
+    // structure is always consistent without any extra normalisation.
+    let (blanked, store) = blank_literals(sanitized_src);
     let func_name_obfuscated = obfuscate_function_names(&blanked);
     let obfuscated_blanked = obfuscate_code(&func_name_obfuscated);
     Ok(restore_literals(&obfuscated_blanked, &store))
@@ -1192,27 +1195,29 @@ mod tests {
         );
     }
 
-    /// Regression test for TestClass10222.
+    /// Regression test for TestClass10222 and TestClass12696.
     ///
-    /// The raw `.java` file on disk contains over-escaped sequences from a
-    /// previous JSONL encoding pass:
-    ///   * `\\"` (double-backslash + quote) instead of `\"` (one backslash + quote)
-    ///   * `\'` (backslash + apostrophe) in `it\'s`
+    /// TestClass10222: the raw file had `\\"` (double-backslash + quote) and
+    /// `\'` artifacts.  Previously `obfuscate_str` called `sanitize_backslashes`
+    /// to normalise `\\"` → `\"`, but this broke TestClass12696 which has a
+    /// valid `"\\\\"` string (value = `\\`): the blind replace turned it into
+    /// `"\\"` (unterminated), causing a literal-count mismatch.
     ///
-    /// Before this fix, `blank_literals` would hit `\\` inside the string,
-    /// treat it as one escape pair (skipping both backslashes), then treat
-    /// the following `"` as the closing quote — closing the string far too
-    /// early.  The rest of the method body was left as raw text outside any
-    /// string, tree-sitter produced ERROR nodes, and the obfuscator silently
-    /// returned the source unchanged (prompt == response in the JSONL).
+    /// The fix: neither `full_sanitize` nor `obfuscate_str` calls
+    /// `sanitize_backslashes`.  Both sides of the JSONL pair go through the
+    /// same `sanitize_structural`-only path, so their literal structure is
+    /// always identical regardless of how many encoding passes the source went
+    /// through.  `blank_literals` / `consume_string_literal` correctly handles
+    /// even backslash runs (pairs) by skipping two bytes at a time.
     ///
-    /// The fix: `obfuscate_str` now calls `sanitize_backslashes` before
-    /// `blank_literals`, normalising `\\"` → `\"` so every string is
-    /// consumed as one correct literal.
+    /// For TestClass10222, the `\\"` sequences mean the string closes earlier
+    /// than intended, but BOTH sides close at the same point, so the literal
+    /// count still matches and `fix_string_literals` can repair the content.
     #[test]
     fn test_testclass10222_identifiers_renamed_despite_double_escaped_backslash_quote() {
-        // Exact content of the raw .java file on disk — with `\\"` and `\'`.
-        let raw = concat!(
+        // Input as produced by full_sanitize (sanitize_structural only, no backslash fix).
+        // The \\" sequences are still present; \' has been converted to '.
+        let sanitized = concat!(
             "public class TestClass10222 {\n",
             "@Test public void should_load_spec() throws Exception {",
             " RestxSpec spec = new RestxSpecLoader(Factory.getInstance()).load(\"cases/test/test.spec.yaml\");",
@@ -1225,25 +1230,12 @@ mod tests {
             " assertThat(((GivenUUIDGenerator) spec.getGiven().get(1)).getPlaybackUUIDs()).containsExactly(\"123456\");",
             " assertThat(spec.getWhens()).extracting(\"method\", \"path\").containsExactly(Tuple.tuple(\"GET\", \"message/xavier\"));",
             " assertThat(spec.getWhens()).extracting(\"then\").extracting(\"expectedCode\", \"expected\")",
-            // \\" = double-backslash+quote (dataset corruption), \' = escaped apostrophe
-            " .containsExactly(Tuple.tuple(200, \"{\\\\\"message\\\\\":\\\\\"hello xavier, it\\'s 14:33:18\\\\\"}\"));",
+            // \\" still present (sanitize_structural does not touch these)
+            " .containsExactly(Tuple.tuple(200, \"{\\\\\"message\\\\\":\\\\\"hello xavier, it's 14:33:18\\\\\"}\"));",
             " }\n}",
         );
 
-        // main.rs calls sanitize_structural first — replicate that here.
-        let sanitized = crate::sanitizer::sanitize_structural(raw);
-
-        // After sanitize_structural: \' → ' but \\" is still present.
-        assert!(
-            sanitized.contains("it's"),
-            "sanitize_structural must convert \\' to '"
-        );
-        assert!(
-            sanitized.contains("\\\\\""),
-            "sanitize_structural must leave \\\\ sequences for sanitize_backslashes"
-        );
-
-        let result = super::obfuscate_str(&sanitized).expect("obfuscate_str must not fail");
+        let result = super::obfuscate_str(sanitized).expect("obfuscate_str must not fail");
 
         // Method name must be renamed.
         assert!(
@@ -1263,7 +1255,7 @@ mod tests {
             "usage 'spec.getTitle()' must use the renamed identifier"
         );
 
-        // String literals must be preserved.
+        // Plain string literals must be preserved.
         assert!(
             result.contains("cases/test/test.spec.yaml"),
             "plain string literal must be preserved"
@@ -1273,10 +1265,67 @@ mod tests {
             "plain string literal must be preserved"
         );
 
-        // Sanity: output must differ from sanitized input.
+        // Sanity: output must differ from input.
         assert_ne!(
             result, sanitized,
             "output must differ from sanitized input — obfuscation must have run"
+        );
+    }
+
+    /// Regression test for TestClass12696.
+    ///
+    /// The test method uses `"\\\\"` — a valid Java string whose value is two
+    /// backslashes.  Previously `sanitize_backslashes` (called from `obfuscate_str`)
+    /// would blindly collapse `\\\\"` to `\\"`, producing an unterminated string.
+    /// `blank_literals` then misidentified the string boundaries, tree-sitter
+    /// produced ERROR nodes, and nothing was renamed.
+    ///
+    /// After the fix (neither side calls `sanitize_backslashes`), `blank_literals`
+    /// correctly identifies `"\\\\"` as a single well-formed literal (the `\\`
+    /// pairs are handled as escape sequences, then `"` closes the string), and
+    /// both local variables plus the method name are renamed.
+    #[test]
+    fn test_testclass12696_valid_backslash_string_not_corrupted() {
+        let input = concat!(
+            "public class TestClass12696 {\n",
+            "@Test public void testProcessShouldHandleBackslashesCorrectly() {",
+            " BasePlaceholder underTest = new TestPlaceholder(\"%s\", \"\\\\\\\\\");",
+            " String result = underTest.process(\"%s\");",
+            " assertThat(result).isEqualTo(\"\\\\\\\\\");",
+            " }\n}",
+        );
+
+        // full_sanitize = sanitize_structural only; no backslash changes here.
+        let sanitized = crate::sanitizer::sanitize_structural(input);
+
+        let result = super::obfuscate_str(&sanitized).expect("obfuscate_str must not fail");
+
+        // Method name must be renamed.
+        assert!(
+            !result.contains("testProcessShouldHandleBackslashesCorrectly"),
+            "method name must be renamed"
+        );
+
+        // Local variables must be renamed.
+        assert!(
+            !result.contains("BasePlaceholder underTest"),
+            "local 'underTest' must be renamed"
+        );
+        assert!(
+            !result.contains("String result"),
+            "local 'result' must be renamed"
+        );
+
+        // The valid \\\\ string literals must be preserved.
+        assert!(
+            result.contains("\\\\\\\\"),
+            "the valid \\\\\\\\ string literal must be preserved verbatim"
+        );
+
+        // Sanity check.
+        assert_ne!(
+            result, sanitized,
+            "obfuscation must have changed the source"
         );
     }
 }
