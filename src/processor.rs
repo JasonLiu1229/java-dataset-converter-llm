@@ -86,6 +86,7 @@ pub fn generate_jsonl(
 }
 #[cfg(test)]
 mod tests {
+    use super::generate_jsonl_from_strings;
     use regex::Regex;
     use std::fs;
     use std::io::ErrorKind;
@@ -541,5 +542,131 @@ mod tests {
             response.contains("\\\\"),
             "repaired response must contain the correct delimiter literal"
         );
+    }
+
+    // ── pipeline contract tests ──────────────────────────────────────────────
+
+    /// Count double-quoted string literals using the same logic as
+    /// `extract_string_literal_spans` / `fix_string_literals`.
+    fn count_string_literals(src: &str) -> usize {
+        let bytes = src.as_bytes();
+        let mut count = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                count += 1;
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+
+    /// Regression: TestClass9305 / TestClass10222.
+    ///
+    /// Dataset files contain `\\"` (double-backslash + quote) from a previous
+    /// JSONL encoding pass.  Before the fix, `sanitized_original` kept the raw
+    /// `\\"` sequences while `obfuscate_str` normalised them internally via
+    /// `sanitize_backslashes`.  The two sides therefore had different string
+    /// literal counts and `generate_jsonl_from_strings` failed with:
+    ///   "String literal count mismatch between prompt and response"
+    ///
+    /// The fix: `main.rs` now calls `sanitize_backslashes` on the raw source
+    /// before producing `sanitized_original`, so both sides start from the
+    /// same normalised bytes.  This test encodes that contract: given the
+    /// already-normalised `sanitized_original`, the obfuscated copy must have
+    /// exactly the same number of string literals, and
+    /// `generate_jsonl_from_strings` must succeed end-to-end.
+    #[test]
+    fn generate_jsonl_succeeds_for_double_escaped_backslash_quote() {
+        // Simulate what main.rs produces after full_sanitize (both phases applied).
+        // The \\" has already been collapsed to \" by sanitize_backslashes.
+        let sanitized_original = concat!(
+            "public class TestClass10222 {\n",
+            "@Test public void should_load_spec() throws Exception {",
+            " RestxSpec spec = new RestxSpecLoader(Factory.getInstance()).load(\"cases/test/test.spec.yaml\");",
+            " assertThat(spec.getTitle()).isEqualTo(\"should say hello\");",
+            " assertThat(spec.getWhens()).extracting(\"then\").extracting(\"expectedCode\", \"expected\")",
+            " .containsExactly(Tuple.tuple(200, \"{\\\"message\\\":\\\"hello xavier, it's 14:33:18\\\"}\"));",
+            " }\n}",
+        );
+
+        let obfuscated = crate::obfuscator::obfuscate_str(sanitized_original)
+            .expect("obfuscate_str must not fail");
+
+        // The core contract: both sides must have the same literal count.
+        let original_count = count_string_literals(sanitized_original);
+        let obfuscated_count = count_string_literals(&obfuscated);
+        assert_eq!(
+            original_count, obfuscated_count,
+            "string literal count mismatch — original={} obfuscated={}\n\
+             generate_jsonl_from_strings would fail with 'String literal count mismatch'",
+            original_count, obfuscated_count
+        );
+
+        // End-to-end: generate_jsonl_from_strings must not return an error.
+        let out = NamedTempFile::new().unwrap();
+        let out_path = format!("{}.jsonl", out.path().display());
+        generate_jsonl_from_strings(sanitized_original, &obfuscated, &out_path)
+            .expect("generate_jsonl_from_strings must not fail with a literal count mismatch");
+
+        let jsonl = fs::read_to_string(&out_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(jsonl.trim()).expect("output must be valid JSON");
+        let prompt = parsed["prompt"].as_str().unwrap();
+        let response = parsed["response"].as_str().unwrap();
+
+        assert_ne!(
+            prompt, response,
+            "prompt and response must differ — obfuscation must have renamed identifiers"
+        );
+        assert!(
+            !prompt.contains("should_load_spec"),
+            "prompt must not contain the original method name"
+        );
+        assert!(
+            response.contains("should_load_spec"),
+            "response must contain the original method name"
+        );
+    }
+
+    /// Same contract for a plain file with no escaping issues — ensures the
+    /// fix does not break the common case.
+    #[test]
+    fn generate_jsonl_literal_counts_match_plain_file() {
+        let sanitized_original = concat!(
+            "public class TestClass100002 {\n",
+            "@Test public final void testGetTransmitStatusMessageNull() {",
+            " XBeeTransmitStatus transmitStatus = null;",
+            " TransmitException e = new TransmitException(transmitStatus);",
+            " String result = e.getTransmitStatusMessage();",
+            " assertThat(\"expected message\", result, is(nullValue(String.class)));",
+            " }\n}",
+        );
+
+        let obfuscated = crate::obfuscator::obfuscate_str(sanitized_original)
+            .expect("obfuscate_str must not fail");
+
+        assert_eq!(
+            count_string_literals(sanitized_original),
+            count_string_literals(&obfuscated),
+            "string literal count must match for a plain file"
+        );
+
+        let out = NamedTempFile::new().unwrap();
+        let out_path = format!("{}.jsonl", out.path().display());
+        generate_jsonl_from_strings(sanitized_original, &obfuscated, &out_path)
+            .expect("generate_jsonl_from_strings must succeed for a plain file");
     }
 }

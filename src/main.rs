@@ -2,7 +2,7 @@ use java_dataset_converter_llm::cli::Args;
 use java_dataset_converter_llm::helper::get_files;
 use java_dataset_converter_llm::obfuscator::obfuscate_str;
 use java_dataset_converter_llm::processor::generate_jsonl_from_strings;
-use java_dataset_converter_llm::sanitizer::sanitize_structural;
+use java_dataset_converter_llm::sanitizer::{sanitize_backslashes, sanitize_structural};
 
 use clap::Parser;
 use indicatif::ProgressBar;
@@ -31,6 +31,10 @@ fn log_error(log_path: &Path, java_file: &Path, stage: &str, err: &dyn std::erro
         java_file.display(),
         err
     );
+}
+
+fn full_sanitize(raw: &str) -> String {
+    sanitize_backslashes(&sanitize_structural(raw))
 }
 
 fn main() -> io::Result<()> {
@@ -71,7 +75,7 @@ fn main() -> io::Result<()> {
 
         let file_name = file.file_name().unwrap().to_str().unwrap();
 
-        // ── 1. Read & structural-sanitize ────────────────────────────────────
+        // ── 1. Read & sanitize (both phases) ─────────────────────────────────
         let raw = match fs::read_to_string(&file) {
             Ok(s) => s,
             Err(e) => {
@@ -81,7 +85,7 @@ fn main() -> io::Result<()> {
                 continue;
             }
         };
-        let sanitized_original = sanitize_structural(&raw);
+        let sanitized_original = full_sanitize(&raw);
 
         // ── 2. Obfuscate in memory ────────────────────────────────────────────
         let obfuscated = match obfuscate_str(&sanitized_original) {
@@ -110,4 +114,27 @@ fn main() -> io::Result<()> {
 
     progress_bar.finish_with_message("Done.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::full_sanitize;
+
+    #[test]
+    fn full_sanitize_normalises_double_escaped_backslash_quote() {
+        // Raw file has \\" (double-backslash + quote) from a JSONL encoding pass.
+        let raw = r#"String s = "{\\"key\\":\\"value\\"}";"#;
+        let result = full_sanitize(raw);
+        // After full_sanitize, \\" must be collapsed to \" — one backslash + quote.
+        assert!(
+            !result.contains("\\\\\""),
+            "full_sanitize must collapse \\\\\"-sequences: got {:?}",
+            result
+        );
+        assert!(
+            result.contains("\\\""),
+            "full_sanitize must preserve \\\" after collapsing: got {:?}",
+            result
+        );
+    }
 }
