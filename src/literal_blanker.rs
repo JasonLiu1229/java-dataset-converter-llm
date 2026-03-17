@@ -122,18 +122,98 @@ pub fn restore_literals(blanked: &str, store: &LiteralStore) -> String {
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// Returns `true` for bytes that cannot validly appear immediately after a
+/// closing `"` in well-formed Java source.
+///
+/// This is used as a look-ahead heuristic inside [`consume_string_literal`]:
+/// when we encounter an even run of backslashes followed by `"`, that `"` is
+/// normally the closing quote.  But in dataset files that have been through one
+/// or more JSONL encoding passes, each `\"` inside a string was doubled to `\\"`.
+/// When `consume_string_literal` hits that `\\"`, it sees an even backslash run
+/// + `"` and would incorrectly close the string, leaving the rest of the content
+/// (e.g. `message\":\"val\"}`) as raw tokens outside any string — making the
+/// blanked source unparseable by tree-sitter.
+///
+/// The heuristic: if the character immediately following the candidate closing
+/// `"` is one that **cannot** start a valid Java token after a string literal
+/// (a letter, digit, `{`, `}`, `:`, `_`, `$`, or `\`), the close is almost
+/// certainly spurious corruption and we treat the `"` as an embedded escaped
+/// quote instead.
+///
+/// Note: this lookahead fires **only** for backslash-preceded `"` (even run).
+/// A bare unescaped `"` always closes the string unconditionally.
+fn is_suspicious_after_even_backslash_close(b: u8) -> bool {
+    matches!(
+        b,
+        b'a'..=b'z'     // letter — identifier or JSON key/value
+        | b'A'..=b'Z'
+        | b'0'..=b'9'   // digit
+        | b'{'          // JSON object open
+        | b'}'          // JSON object close (safe to add: only fires for backslash-preceded ")
+        | b':'          // JSON key-value separator
+        | b'_'          // identifier char
+        | b'$'          // identifier char
+        | b'\\'         // another backslash run follows
+    )
+}
+
+/// Consume a double-quoted Java string literal starting at byte offset `start`.
+///
+/// Returns `(full_literal_text, one_past_closing_quote)`.
+///
+/// Handles standard Java escape sequences (`\"`, `\\`, etc.) and also applies
+/// a corruption-recovery heuristic for dataset files that contain `\\"` where
+/// they should contain `\"`: when an even backslash run precedes a `"` and the
+/// byte immediately after that `"` looks like it could not start a valid Java
+/// token after a string close, the `"` is treated as an embedded escaped quote
+/// and scanning continues.
+///
+/// Does **not** handle Java 15+ text blocks (triple-quote).
 fn consume_string_literal(bytes: &[u8], start: usize) -> (String, usize) {
     debug_assert_eq!(bytes[start], b'"');
     let mut i = start + 1;
 
     while i < bytes.len() {
         match bytes[i] {
-            b'\\' => i += 2, // skip escape pair  \"  or  \\
+            b'\\' => {
+                // Count the full run of consecutive backslashes.
+                let run_start = i;
+                while i < bytes.len() && bytes[i] == b'\\' {
+                    i += 1;
+                }
+                let run_len = i - run_start;
+
+                if i < bytes.len() && bytes[i] == b'"' {
+                    if run_len % 2 == 0 {
+                        // Even run: all backslashes form escape pairs, so the `"` would
+                        // normally be the closing quote.  Apply the corruption heuristic.
+                        let next = bytes.get(i + 1).copied().unwrap_or(b' ');
+                        if is_suspicious_after_even_backslash_close(next) {
+                            // Looks like a corrupt `\\"` (should be `\"`).  Treat as
+                            // embedded and keep scanning.
+                            i += 1;
+                        } else {
+                            // The `"` is genuinely the closing quote.
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        // Odd run: the last backslash escapes the `"` — embedded quote,
+                        // keep scanning.
+                        i += 1;
+                    }
+                }
+                // If the run is not followed by `"`, the bytes were already consumed;
+                // just continue the outer loop.
+            }
             b'"' => {
+                // Bare unescaped closing quote — always ends the string.
                 i += 1;
                 break;
             }
-            _ => i += 1,
+            _ => {
+                i += 1;
+            }
         }
     }
 
@@ -595,6 +675,105 @@ mod tests {
         assert!(
             blanked.contains("assertTrue"),
             "identifier 'assertTrue' must survive"
+        );
+        assert_eq!(
+            restore_literals(&blanked, &store),
+            src,
+            "round-trip must be lossless"
+        );
+    }
+
+    // ── corruption-recovery heuristic tests ─────────────────────────────────
+
+    /// TestClass12696 regression: `"\\\\"` is a valid Java string whose value is
+    /// two backslashes.  The even backslash run (4 backslashes) precedes the
+    /// closing `"`, and the next char is `)` — not suspicious — so the string
+    /// closes correctly and is preserved as a single literal.
+    #[test]
+    fn consume_string_valid_double_backslash_not_split() {
+        let src = "assertThat(result).isEqualTo(\"\\\\\\\\\");";
+        let (blanked, store) = blank_literals(src);
+        assert_eq!(store.entries.len(), 1, "valid \\\\\\\\ must be one literal");
+        assert_eq!(
+            restore_literals(&blanked, &store),
+            src,
+            "round-trip must be lossless"
+        );
+    }
+
+    /// Corrupt `{\\\"key\\\":\\\"val\\\"}` — dataset encoding artifact where each
+    /// `\"` inside a JSON string was doubled to `\\"`.  The heuristic detects that
+    /// letters and `:` after the candidate close are suspicious and keeps scanning,
+    /// producing one correct literal instead of several broken fragments.
+    #[test]
+    fn consume_string_corrupt_json_in_java_is_single_literal() {
+        let src = "isEqualTo(\"{\\\\\"message\\\\\":\\\\\"val\\\\\"}\");";
+        let (blanked, store) = blank_literals(src);
+        assert_eq!(
+            store.entries.len(),
+            1,
+            "corrupt JSON string must be one literal"
+        );
+        assert!(blanked.contains("isEqualTo"), "method call must survive");
+        assert_eq!(
+            restore_literals(&blanked, &store),
+            src,
+            "round-trip must be lossless"
+        );
+    }
+
+    /// TestClass10222 regression: full method body with `\\"` corruption AND
+    /// a plain apostrophe inside the string value.  The blanked source must have
+    /// all identifiers visible so tree-sitter can parse the method.
+    #[test]
+    fn blanked_form_is_clean_testclass10222_corrupt_backslash_quote() {
+        let src = concat!(
+            "public class TestClass10222 {\n",
+            "@Test public void should_load_spec() throws Exception {",
+            " RestxSpec spec = new RestxSpecLoader(Factory.getInstance()).load(\"cases/test/test.spec.yaml\");",
+            " assertThat(spec.getTitle()).isEqualTo(\"should say hello\");",
+            " assertThat(spec.getWhens()).extracting(\"then\").extracting(\"expectedCode\", \"expected\")",
+            " .containsExactly(Tuple.tuple(200, \"{\\\\\"message\\\\\":\\\\\"hello xavier, it's 14:33:18\\\\\"}\"));",
+            " }\n}",
+        );
+        let (blanked, store) = blank_literals(src);
+
+        // All identifiers must be outside string placeholders.
+        assert!(
+            blanked.contains("RestxSpec spec"),
+            "local 'spec' declaration must be visible"
+        );
+        assert!(
+            blanked.contains("should_load_spec"),
+            "method name must be visible"
+        );
+
+        // No escaped quotes must remain in the blanked source.
+        assert!(
+            !blanked.contains("\\\""),
+            "no escaped quotes in blanked source"
+        );
+
+        // Round-trip must be lossless.
+        assert_eq!(
+            restore_literals(&blanked, &store),
+            src,
+            "round-trip must be lossless"
+        );
+    }
+
+    /// `new String[]{"foo"}` — `}` directly after a plain unescaped `"` is valid
+    /// Java (array initializer close).  The heuristic must NOT fire here because
+    /// the closing `"` is bare (no preceding backslash run), so it is always treated
+    /// as a string terminator regardless of the following character.
+    #[test]
+    fn consume_string_array_initializer_closing_brace_not_suspicious() {
+        let src = "String[] a = new String[]{\"foo\"};";
+        let (blanked, store) = blank_literals(src);
+        assert_eq!(
+            store.entries.len(),
+            1,
+            "array initializer must produce exactly one literal"
         );
         assert_eq!(
             restore_literals(&blanked, &store),

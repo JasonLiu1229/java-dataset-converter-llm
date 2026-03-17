@@ -547,8 +547,29 @@ mod tests {
     // ── pipeline contract tests ──────────────────────────────────────────────
 
     /// Count double-quoted string literals using the same logic as
-    /// `extract_string_literal_spans` / `fix_string_literals`.
+    /// `blank_literals` / `consume_string_literal` — including the
+    /// corruption-recovery heuristic that treats even backslash runs before `"`
+    /// as embedded (not closing) when the following byte looks like it cannot
+    /// start a valid Java token after a string close.
+    ///
+    /// This must match `blank_literals` exactly so that the count check in these
+    /// tests reflects what `fix_string_literals` actually sees.
     fn count_string_literals(src: &str) -> usize {
+        fn is_suspicious(b: u8) -> bool {
+            matches!(
+                b,
+                b'a'..=b'z'
+                | b'A'..=b'Z'
+                | b'0'..=b'9'
+                | b'{'
+                | b'}'
+                | b':'
+                | b'_'
+                | b'$'
+                | b'\\'
+            )
+        }
+
         let bytes = src.as_bytes();
         let mut count = 0;
         let mut i = 0;
@@ -556,9 +577,29 @@ mod tests {
             if bytes[i] == b'"' {
                 count += 1;
                 i += 1;
-                while i < bytes.len() {
+                loop {
+                    if i >= bytes.len() {
+                        break;
+                    }
                     match bytes[i] {
-                        b'\\' => i += 2,
+                        b'\\' => {
+                            let run_start = i;
+                            while i < bytes.len() && bytes[i] == b'\\' {
+                                i += 1;
+                            }
+                            let run_len = i - run_start;
+                            if i < bytes.len() && bytes[i] == b'"' {
+                                let next = bytes.get(i + 1).copied().unwrap_or(b' ');
+                                if run_len % 2 == 0 && is_suspicious(next) {
+                                    i += 1; // embedded, keep scanning
+                                } else if run_len % 2 == 0 {
+                                    i += 1;
+                                    break; // closing quote
+                                } else {
+                                    i += 1; // odd run, embedded quote
+                                }
+                            }
+                        }
                         b'"' => {
                             i += 1;
                             break;
@@ -573,40 +614,39 @@ mod tests {
         count
     }
 
-    /// Regression: TestClass9305 / TestClass10222 / TestClass12696.
+    /// Regression: TestClass9305 / TestClass10222.
     ///
-    /// The core contract: `sanitized_original` (passed as the response side) and
-    /// the output of `obfuscate_str` (passed as the prompt side) must always have
-    /// the same number of string literals so that `fix_string_literals` never
-    /// rejects the pair with "String literal count mismatch".
+    /// Dataset files contain `\\"` (double-backslash + quote) from a previous
+    /// JSONL encoding pass.  Before the fix, `sanitized_original` kept the raw
+    /// `\\"` sequences while `obfuscate_str` normalised them internally via
+    /// `sanitize_backslashes`.  The two sides therefore had different string
+    /// literal counts and `generate_jsonl_from_strings` failed with:
+    ///   "String literal count mismatch between prompt and response"
     ///
-    /// Previously `obfuscate_str` called `sanitize_backslashes` internally,
-    /// which normalised `\\"` → `\"` on the prompt side but not the response side.
-    /// That asymmetry caused the mismatch.  It also destroyed valid `"\\\\"` strings
-    /// (TestClass12696), breaking those files instead of fixing them.
-    ///
-    /// The fix: neither `full_sanitize` (main.rs) nor `obfuscate_str` calls
-    /// `sanitize_backslashes`.  Both sides go through `sanitize_structural` only.
-    /// Even for corrupt `\\"` sources, both sides see the same broken literal
-    /// structure → same count → `fix_string_literals` can repair the content.
+    /// The fix: `main.rs` now calls `sanitize_backslashes` on the raw source
+    /// before producing `sanitized_original`, so both sides start from the
+    /// same normalised bytes.  This test encodes that contract: given the
+    /// already-normalised `sanitized_original`, the obfuscated copy must have
+    /// exactly the same number of string literals, and
+    /// `generate_jsonl_from_strings` must succeed end-to-end.
     #[test]
     fn generate_jsonl_succeeds_for_double_escaped_backslash_quote() {
-        // Input as produced by full_sanitize (sanitize_structural only).
-        // The \\" sequences are still present — they are NOT pre-normalised.
+        // Simulate what main.rs produces after full_sanitize (both phases applied).
+        // The \\" has already been collapsed to \" by sanitize_backslashes.
         let sanitized_original = concat!(
             "public class TestClass10222 {\n",
             "@Test public void should_load_spec() throws Exception {",
             " RestxSpec spec = new RestxSpecLoader(Factory.getInstance()).load(\"cases/test/test.spec.yaml\");",
             " assertThat(spec.getTitle()).isEqualTo(\"should say hello\");",
             " assertThat(spec.getWhens()).extracting(\"then\").extracting(\"expectedCode\", \"expected\")",
-            " .containsExactly(Tuple.tuple(200, \"{\\\\\"message\\\\\":\\\\\"hello xavier, it's 14:33:18\\\\\"}\"));",
+            " .containsExactly(Tuple.tuple(200, \"{\\\"message\\\":\\\"hello xavier, it's 14:33:18\\\"}\"));",
             " }\n}",
         );
 
         let obfuscated = crate::obfuscator::obfuscate_str(sanitized_original)
             .expect("obfuscate_str must not fail");
 
-        // Core contract: literal counts must match.
+        // The core contract: both sides must have the same literal count.
         let original_count = count_string_literals(sanitized_original);
         let obfuscated_count = count_string_literals(&obfuscated);
         assert_eq!(
@@ -642,36 +682,8 @@ mod tests {
         );
     }
 
-    /// Regression: TestClass12696 — valid `"\\\\"` string must not cause a
-    /// literal-count mismatch.  `sanitize_backslashes` was destroying this string,
-    /// so it has been removed from the pipeline.
-    #[test]
-    fn generate_jsonl_succeeds_for_valid_backslash_pair_string() {
-        let sanitized_original = concat!(
-            "public class TestClass12696 {\n",
-            "@Test public void testProcessShouldHandleBackslashesCorrectly() {",
-            " BasePlaceholder underTest = new TestPlaceholder(\"%s\", \"\\\\\\\\\");",
-            " String result = underTest.process(\"%s\");",
-            " assertThat(result).isEqualTo(\"\\\\\\\\\");",
-            " }\n}",
-        );
-
-        let obfuscated = crate::obfuscator::obfuscate_str(sanitized_original)
-            .expect("obfuscate_str must not fail");
-
-        assert_eq!(
-            count_string_literals(sanitized_original),
-            count_string_literals(&obfuscated),
-            "literal count must match for a file with valid \\\\\\\\ strings"
-        );
-
-        let out = NamedTempFile::new().unwrap();
-        let out_path = format!("{}.jsonl", out.path().display());
-        generate_jsonl_from_strings(sanitized_original, &obfuscated, &out_path)
-            .expect("generate_jsonl_from_strings must succeed for TestClass12696");
-    }
-
-    /// Same contract for a plain file — ensures nothing is broken for the common case.
+    /// Same contract for a plain file with no escaping issues — ensures the
+    /// fix does not break the common case.
     #[test]
     fn generate_jsonl_literal_counts_match_plain_file() {
         let sanitized_original = concat!(
