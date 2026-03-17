@@ -136,9 +136,9 @@ pub fn restore_literals(blanked: &str, store: &LiteralStore) -> String {
 ///
 /// The heuristic: if the character immediately following the candidate closing
 /// `"` is one that **cannot** start a valid Java token after a string literal
-/// (a letter, digit, `{`, `}`, `:`, `_`, `$`, or `\`), the close is almost
-/// certainly spurious corruption and we treat the `"` as an embedded escaped
-/// quote instead.
+/// (a letter, digit, or any JSON structural character: `{`, `}`, `:`, `,`,
+/// `[`, `]`, `_`, `$`, or `\`), the close is almost certainly spurious
+/// corruption and we treat the `"` as an embedded escaped quote instead.
 ///
 /// Note: this lookahead fires **only** for backslash-preceded `"` (even run).
 /// A bare unescaped `"` always closes the string unconditionally.
@@ -151,6 +151,9 @@ fn is_suspicious_after_even_backslash_close(b: u8) -> bool {
         | b'{'          // JSON object open
         | b'}'          // JSON object close (safe to add: only fires for backslash-preceded ")
         | b':'          // JSON key-value separator
+        | b','          // JSON array/object separator
+        | b'['          // JSON array open
+        | b']'          // JSON array close
         | b'_'          // identifier char
         | b'$'          // identifier char
         | b'\\'         // another backslash run follows
@@ -715,6 +718,44 @@ mod tests {
             "corrupt JSON string must be one literal"
         );
         assert!(blanked.contains("isEqualTo"), "method call must survive");
+        assert_eq!(
+            restore_literals(&blanked, &store),
+            src,
+            "round-trip must be lossless"
+        );
+    }
+
+    /// TestClass11957 regression: JSON array with comma and bracket separators
+    /// inside a corrupt `\\"` string.  `[\\"abcd\\",\\"adcb\\"]` — the `\\"` before
+    /// `,` and `]` must both be treated as embedded (`,`, `[`, `]` added to the
+    /// suspicious set).
+    #[test]
+    fn consume_string_corrupt_json_array_with_comma_is_single_literal() {
+        let src = "equalTo(\"{\\\\\"4\\\\\":[\\\\\"abcd\\\\\",\\\\\"adcb\\\\\"],\\\\\"5\\\\\":[\\\\\"deff\\\\\"]}\")";
+        let (blanked, store) = blank_literals(src);
+        assert_eq!(
+            store.entries.len(),
+            1,
+            "JSON array string must be one literal"
+        );
+        assert!(blanked.contains("equalTo"), "method call must survive");
+        assert_eq!(
+            restore_literals(&blanked, &store),
+            src,
+            "round-trip must be lossless"
+        );
+    }
+
+    /// TestClass11952 regression: JSON object literal with array values.
+    #[test]
+    fn consume_string_corrupt_json_object_with_array_is_single_literal() {
+        let src = "readValue(\"{\\\\\"2\\\\\":[\\\\\"ABCDEF\\\\\"],\\\\\"4\\\\\":[\\\\\"FEDCEB\\\\\"]}\", TeamTagMap.class)";
+        let (blanked, store) = blank_literals(src);
+        assert_eq!(
+            store.entries.len(),
+            1,
+            "JSON string is one literal; TeamTagMap.class has none"
+        );
         assert_eq!(
             restore_literals(&blanked, &store),
             src,
