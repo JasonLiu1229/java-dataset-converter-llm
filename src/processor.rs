@@ -1,3 +1,4 @@
+use crate::literal_blanker::blank_literals_permanently;
 use crate::sanitizer::{sanitize_backslashes, sanitize_structural};
 use serde::Serialize;
 use std::fs;
@@ -13,10 +14,9 @@ struct PromptResponse {
 
 /// Write a JSONL training pair from in-memory source strings.
 ///
-/// Both sides are expected to have had string literals permanently replaced
-/// with dummy values by `obfuscate_str`. This function applies
-/// `sanitize_backslashes` to clean up any residual over-encoded backslash
-/// sequences in non-string tokens.
+/// String literals are permanently replaced with `"_"` on both sides before
+/// writing. `sanitize_backslashes` is then applied to clean up any residual
+/// over-encoded backslash sequences in non-string tokens.
 pub fn generate_jsonl_from_strings(
     original_src: &str,
     obfuscated_src: &str,
@@ -29,8 +29,8 @@ pub fn generate_jsonl_from_strings(
         ));
     }
 
-    let prompt = sanitize_backslashes(obfuscated_src);
-    let response = sanitize_backslashes(original_src);
+    let prompt = sanitize_backslashes(&blank_literals_permanently(obfuscated_src));
+    let response = sanitize_backslashes(&blank_literals_permanently(original_src));
 
     if prompt.trim().is_empty() {
         return Err(std::io::Error::new(
@@ -137,11 +137,17 @@ mod tests {
             &out_path,
         );
 
-        assert!(result.is_err(), "must fail when the obfuscated file is empty");
+        assert!(
+            result.is_err(),
+            "must fail when the obfuscated file is empty"
+        );
         assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidData);
 
         let written = fs::read_to_string(&out_path).unwrap_or_default();
-        assert!(written.trim().is_empty(), "no JSONL must be written on error");
+        assert!(
+            written.trim().is_empty(),
+            "no JSONL must be written on error"
+        );
     }
 
     #[test]
@@ -165,10 +171,13 @@ mod tests {
 
         let jsonl = fs::read_to_string(&out_path).unwrap();
         assert!(
-            jsonl.contains("'A'"),
-            "unicode escape must be resolved; got: {jsonl}"
+            jsonl.contains("'X'"),
+            "char literal must be replaced with dummy 'X'; got: {jsonl}"
         );
-        assert!(!jsonl.contains("\\u0027"), "raw unicode escape must not survive");
+        assert!(
+            !jsonl.contains("\\u0027"),
+            "raw unicode escape must not survive"
+        );
     }
 
     #[test]
@@ -198,8 +207,14 @@ mod tests {
 
         let prompt = parsed["prompt"].as_str().unwrap();
         assert!(!prompt.is_empty());
-        assert!(prompt.contains("func_1"), "prompt must contain obfuscated method name");
-        assert!(prompt.contains("var_1"), "prompt must contain obfuscated variable name");
+        assert!(
+            prompt.contains("func_1"),
+            "prompt must contain obfuscated method name"
+        );
+        assert!(
+            prompt.contains("var_1"),
+            "prompt must contain obfuscated variable name"
+        );
 
         let response = parsed["response"].as_str().unwrap();
         assert!(!response.is_empty());
@@ -207,7 +222,10 @@ mod tests {
             response.contains("testGetTransmitStatusMessageNull"),
             "response must contain original method name"
         );
-        assert!(response.contains("result"), "response must contain original variable name");
+        assert!(
+            response.contains("result"),
+            "response must contain original variable name"
+        );
     }
 
     // ── regression tests ──────────────────────────────────────────────────────
@@ -253,7 +271,10 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), ErrorKind::InvalidData);
 
         let written = fs::read_to_string(&out_path).unwrap_or_default();
-        assert!(written.trim().is_empty(), "no JSONL must be written on error");
+        assert!(
+            written.trim().is_empty(),
+            "no JSONL must be written on error"
+        );
     }
 
     /// Regression: TestClass95132 — valid pair must produce correct JSONL.
@@ -326,18 +347,55 @@ mod tests {
         assert!(!prompt.is_empty());
         assert!(!response.is_empty());
 
-        assert!(prompt.contains("func_1"), "prompt must contain obfuscated method name");
-        assert!(prompt.contains("var_1"), "prompt must contain obfuscated var_1");
-        assert!(prompt.contains("var_8"), "prompt must contain obfuscated var_8");
-        assert!(!prompt.contains("testWithMoreData"), "prompt must not expose original method name");
-        assert!(!prompt.contains("variableDefItem"), "prompt must not expose original var name");
+        assert!(
+            prompt.contains("func_1"),
+            "prompt must contain obfuscated method name"
+        );
+        assert!(
+            prompt.contains("var_1"),
+            "prompt must contain obfuscated var_1"
+        );
+        assert!(
+            prompt.contains("var_8"),
+            "prompt must contain obfuscated var_8"
+        );
+        assert!(
+            !prompt.contains("testWithMoreData"),
+            "prompt must not expose original method name"
+        );
+        assert!(
+            !prompt.contains("variableDefItem"),
+            "prompt must not expose original var name"
+        );
 
-        assert!(response.contains("testWithMoreData"), "response must contain original method name");
-        assert!(response.contains("variableDefItem"), "response must contain original var name");
-        assert!(response.contains("text"), "response must contain original var 'text'");
-        assert!(response.contains("data"), "response must contain original var 'data'");
-        assert!(!response.contains("func_1"), "response must not contain obfuscated method name");
-        assert!(!response.contains("var_1"), "response must not contain obfuscated var names");
+        assert!(
+            response.contains("testWithMoreData"),
+            "response must contain original method name"
+        );
+        assert!(
+            response.contains("variableDefItem"),
+            "response must contain original var name"
+        );
+        assert!(
+            response.contains("text"),
+            "response must contain original var 'text'"
+        );
+        assert!(
+            response.contains("data"),
+            "response must contain original var 'data'"
+        );
+        assert!(
+            !response.contains("func_1"),
+            "response must not contain obfuscated method name"
+        );
+        assert!(
+            !response.contains("var_1"),
+            "response must not contain obfuscated var names"
+        );
+        assert!(
+            prompt.contains("\"_\"") && response.contains("\"_\""),
+            "both sides must have dummy string literals"
+        );
     }
 
     /// Regression: TestClass13026 — corrupt string literals in the original are
@@ -382,9 +440,22 @@ mod tests {
         let response = parsed["response"].as_str().unwrap();
 
         assert_ne!(prompt, response, "prompt and response must differ");
-        assert!(response.contains("testSetDelimiter"), "response must contain original method name");
-        assert!(response.contains("dispatcher"), "response must contain original variable name");
-        assert!(!prompt.contains("testSetDelimiter"), "prompt must not contain original method name");
+        assert!(
+            response.contains("testSetDelimiter"),
+            "response must contain original method name"
+        );
+        assert!(
+            response.contains("dispatcher"),
+            "response must contain original variable name"
+        );
+        assert!(
+            !prompt.contains("testSetDelimiter"),
+            "prompt must not contain original method name"
+        );
+        assert!(
+            prompt.contains("\"_\"") && response.contains("\"_\""),
+            "both sides must have dummy string literals"
+        );
     }
 
     /// Regression: TestClass10222 — end-to-end pipeline via `obfuscate_str` +
@@ -416,8 +487,18 @@ mod tests {
         let response = parsed["response"].as_str().unwrap();
 
         assert_ne!(prompt, response, "prompt and response must differ");
-        assert!(!prompt.contains("should_load_spec"), "prompt must not contain original method name");
-        assert!(response.contains("should_load_spec"), "response must contain original method name");
+        assert!(
+            !prompt.contains("should_load_spec"),
+            "prompt must not contain original method name"
+        );
+        assert!(
+            response.contains("should_load_spec"),
+            "response must contain original method name"
+        );
+        assert!(
+            prompt.contains("\"_\"") && response.contains("\"_\""),
+            "both sides must have dummy string literals"
+        );
     }
 
     /// Regression: plain file with no escaping issues must produce a valid pair.
@@ -449,5 +530,9 @@ mod tests {
         assert_ne!(prompt, response, "prompt and response must differ");
         assert!(response.contains("testGetTransmitStatusMessageNull"));
         assert!(!prompt.contains("testGetTransmitStatusMessageNull"));
+        assert!(
+            prompt.contains("\"_\"") && response.contains("\"_\""),
+            "both sides must have dummy string literals"
+        );
     }
 }

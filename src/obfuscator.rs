@@ -704,6 +704,8 @@ pub fn obfuscate(input_file: &str, output_file: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::obfuscator::obfuscate_str;
+
     #[test]
     fn test_obfuscate_function_names() {
         let input = "public class Test { public void myFunction() {} }";
@@ -1362,15 +1364,50 @@ mod tests {
         assert_ne!(result, input, "obfuscation must have changed the source");
     }
 
-    /// Regression: TestClass10179.
+    /// Regression: TestClass10179 (valid Java variant).
+    ///
+    /// The string argument contains `\\n` (backslash-n escape) and `\"name\"`
+    /// (backslash-quote = valid embedded quote). This is well-formed Java —
+    /// tree-sitter parses it cleanly with no ERROR nodes, so the normal path
+    /// through `obfuscate_str` must rename identifiers without any fallback.
+    #[test]
+    fn test_testclass10179_valid_escaped_quote_in_string_obfuscates_normally() {
+        // Java source bytes:  "{\\n \"name\" : \"test1\"\\n}"
+        //   \\n  = backslash + n  (Java \n escape = newline in string value)
+        //   \"   = backslash + quote (valid Java embedded quote)
+        // This is fully valid Java — tree-sitter parses it cleanly.
+        let input = concat!(
+            "public class TestClass10179 {\n",
+            "@Test public void should_provide_etag() throws Exception {",
+            " HttpRequest request = client().GET(\"/api/etag/test1\");",
+            " assertHttpResponse(request, 200, \"{\\\\n \\\"name\\\" : \\\"test1\\\"\\\\n}\");",
+            " assertThat(request.header(\"ETag\")).isEqualTo(\"5a105e8b9d40e1329780d62ea2265d8a\");",
+            " }\n}",
+        );
+
+        let result = obfuscate_str(input).expect("obfuscate_str must not fail");
+
+        assert_ne!(result, input, "obfuscation must have changed the source");
+        assert!(
+            !result.contains("should_provide_etag"),
+            "method must be renamed"
+        );
+        assert!(
+            !result.contains("HttpRequest request"),
+            "local 'request' must be renamed"
+        );
+        assert!(
+            result.contains("\"_\""),
+            "string literals must be replaced with dummy value"
+        );
+    }
+
+    /// Regression: TestClass10179 (corrupt Java variant).
     ///
     /// The raw .java file contains `\\"name\\"` — two backslashes followed by
-    /// a bare double-quote.  Java parses `\\` as a complete escaped-backslash,
+    /// a bare double-quote. Java parses `\\` as a complete escaped-backslash,
     /// then the bare `"` closes the string early, so tree-sitter produces ERROR
-    /// nodes.  Before the fix, `obfuscate_str` silently returned the input
-    /// unchanged (prompt == response in the JSONL pair).
-    ///
-    /// After the fix, `obfuscate_str` detects the ERROR nodes, retries with
+    /// nodes. `obfuscate_str` detects the ERROR nodes, retries with
     /// `sanitize_backslashes` applied (collapsing `\\"` → `\"`), and
     /// successfully renames all identifiers.
     #[test]
