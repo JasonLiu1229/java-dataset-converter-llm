@@ -14,9 +14,11 @@ struct PromptResponse {
 
 /// Write a JSONL training pair from in-memory source strings.
 ///
-/// String literals are permanently replaced with `"_"` on both sides before
-/// writing. `sanitize_backslashes` is then applied to clean up any residual
-/// over-encoded backslash sequences in non-string tokens.
+/// Both sides go through `sanitize_backslashes` first to collapse any
+/// over-encoded `\\"` sequences into valid `\"`, then
+/// `blank_literals_permanently` replaces every string/char literal with
+/// `"_"` / `'X'`. This order matters: blanking before normalisation would
+/// leave corrupt `\\"` patterns splitting string boundaries incorrectly.
 pub fn generate_jsonl_from_strings(
     original_src: &str,
     obfuscated_src: &str,
@@ -29,8 +31,8 @@ pub fn generate_jsonl_from_strings(
         ));
     }
 
-    let prompt = sanitize_backslashes(&blank_literals_permanently(obfuscated_src));
-    let response = sanitize_backslashes(&blank_literals_permanently(original_src));
+    let prompt = blank_literals_permanently(&sanitize_backslashes(obfuscated_src));
+    let response = blank_literals_permanently(&sanitize_backslashes(original_src));
 
     if prompt.trim().is_empty() {
         return Err(std::io::Error::new(
