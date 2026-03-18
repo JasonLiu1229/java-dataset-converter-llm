@@ -13,6 +13,58 @@ struct LiteralEntry {
 // blank_literals
 // ---------------------------------------------------------------------------
 
+pub fn blank_literals_permanently(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+
+    while i < len {
+        // line comment
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            let start = i;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&src[start..i]);
+            continue;
+        }
+        // block comment
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            out.push_str(&src[start..i]);
+            continue;
+        }
+        // string literal — consume it entirely, emit dummy
+        if bytes[i] == b'"' {
+            let (_literal, end) = consume_string_literal(bytes, i);
+            out.push_str("\"_\"");
+            i = end;
+            continue;
+        }
+        // char literal
+        if bytes[i] == b'\'' {
+            if let Some((_literal, end)) = try_consume_char_literal(bytes, i) {
+                out.push_str("'X'");
+                i = end;
+                continue;
+            }
+        }
+        let ch = src[i..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
 /// Replace every string / char literal in `src` with a stable placeholder.
 ///
 /// Returns `(blanked_source, store)`.

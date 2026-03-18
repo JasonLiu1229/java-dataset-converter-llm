@@ -7,7 +7,7 @@ use std::io;
 
 use tree_sitter::{Node, Parser};
 
-use crate::literal_blanker::{blank_literals, restore_literals};
+use crate::literal_blanker::blank_literals_permanently;
 use crate::sanitizer::{sanitize_backslashes, sanitize_structural};
 
 thread_local! {
@@ -677,44 +677,17 @@ fn has_parse_errors(src: &str) -> bool {
 }
 
 pub fn obfuscate_str(sanitized_src: &str) -> io::Result<String> {
-    // Some dataset files contain `\\"` (two backslashes + bare quote) produced
-    // by an extra round of JSONL encoding.  Java (and tree-sitter) parses `\\`
-    // as a complete escaped-backslash, then the bare `"` closes the string
-    // early, resulting in ERROR nodes throughout the AST.  When that happens
-    // `walk_methods` silently bails and the obfuscator returns the source
-    // unchanged (prompt == response in the JSONL pair).
-    //
-    // Fix: after blanking the literals, check whether the blanked source has
-    // any parse errors.  If it does, re-run the whole pipeline on a version
-    // that has had `sanitize_backslashes` applied.  `sanitize_backslashes`
-    // collapses `\\"` (2bs+quote) → `\"` (1bs+quote), turning broken string
-    // closes into valid embedded quotes.
-    //
-    // Applying `sanitize_backslashes` unconditionally before blanking would
-    // corrupt valid Java strings like `"\\\\"` (value `\\`, two backslashes):
-    // the trailing `\\"` (last two backslashes + closing quote) would be
-    // collapsed to `\"`, destroying the string.  The try-first / fallback
-    // approach avoids this: valid Java is never ERROR-free after blanking,
-    // so the fallback path is only reached by actually-broken sources.
-    let (blanked, store) = blank_literals(sanitized_src);
+    let blanked = blank_literals_permanently(sanitized_src);
 
-    // Fast path: no parse errors → obfuscate as normal.
-    if !has_parse_errors(&blanked) {
-        let func_name_obfuscated = obfuscate_function_names(&blanked);
-        let obfuscated_blanked = obfuscate_code(&func_name_obfuscated);
-        return Ok(restore_literals(&obfuscated_blanked, &store));
-    }
+    let blanked = if has_parse_errors(&blanked) {
+        let recovered = sanitize_backslashes(sanitized_src);
+        blank_literals_permanently(&recovered)
+    } else {
+        blanked
+    };
 
-    // Fallback: the source has ERROR nodes.  Try collapsing over-escaped
-    // backslash-quote sequences and re-blanking.
-    let recovered = sanitize_backslashes(sanitized_src);
-    let (blanked2, store2) = blank_literals(&recovered);
-
-    // Whether or not the second parse is clean, proceed — any improvement
-    // is better than returning the source unchanged.
-    let func_name_obfuscated2 = obfuscate_function_names(&blanked2);
-    let obfuscated_blanked2 = obfuscate_code(&func_name_obfuscated2);
-    Ok(restore_literals(&obfuscated_blanked2, &store2))
+    let func_name_obfuscated = obfuscate_function_names(&blanked);
+    Ok(obfuscate_code(&func_name_obfuscated))
 }
 
 /// File-based wrapper kept for CLI tooling that wants obfuscated `.java` files
@@ -1177,8 +1150,8 @@ mod tests {
             "local 'httpRequest' declaration must be renamed"
         );
         assert!(
-            result.contains("{\\\"message\\\":\\\"hello xavier, it's 14:33:18\\\"}"),
-            "string literal contents must be preserved after obfuscation"
+            result.contains("\"_\""),
+            "string literals must be replaced with dummy value"
         );
         assert_ne!(
             result, input,
@@ -1231,13 +1204,10 @@ mod tests {
             "usage 'spec.getTitle()' must use the renamed identifier"
         );
         assert!(
-            result.contains("cases/test/test.spec.yaml"),
-            "plain string literal must be preserved"
+            result.contains("\"_\""),
+            "string literals must be replaced with dummy value"
         );
-        assert!(
-            result.contains("should say hello"),
-            "plain string literal must be preserved"
-        );
+
         assert_ne!(
             result, sanitized,
             "output must differ from sanitized input — obfuscation must have run"
@@ -1388,7 +1358,7 @@ mod tests {
             !result.contains("String result"),
             "local 'result' must be renamed"
         );
-        assert_literal_count_preserved("10150-style", input);
+
         assert_ne!(result, input, "obfuscation must have changed the source");
     }
 
@@ -1435,8 +1405,8 @@ mod tests {
         );
         // The string literal content must be preserved (only identifiers renamed).
         assert!(
-            result.contains("5a105e8b9d40e1329780d62ea2265d8a"),
-            "string literal content must be preserved"
+            result.contains("\"_\""),
+            "string literals must be replaced with dummy value"
         );
     }
 }
