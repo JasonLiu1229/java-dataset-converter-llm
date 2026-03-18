@@ -96,6 +96,7 @@ pub(crate) fn extract_string_literal_spans(src: &str) -> Vec<(usize, usize)> {
                 | b','
                 | b'['
                 | b']'
+                | b'\''  // apostrophe — never directly follows a Java string close
                 | b'_'
                 | b'$'
                 | b'\\'

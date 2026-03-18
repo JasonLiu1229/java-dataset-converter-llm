@@ -154,6 +154,7 @@ fn is_suspicious_after_even_backslash_close(b: u8) -> bool {
         | b','          // JSON array/object separator
         | b'['          // JSON array open
         | b']'          // JSON array close
+        | b'\''         // apostrophe — never directly follows a Java string close
         | b'_'          // identifier char
         | b'$'          // identifier char
         | b'\\'         // another backslash run follows
@@ -756,6 +757,35 @@ mod tests {
             1,
             "JSON string is one literal; TeamTagMap.class has none"
         );
+        assert_eq!(
+            restore_literals(&blanked, &store),
+            src,
+            "round-trip must be lossless"
+        );
+    }
+
+    /// TestClass10150 regression: string ending with `{}\\"':=`.
+    ///
+    /// After `sanitize_structural` converts `\\'` → `'`, the source contains
+    /// `\\"'` — a two-backslash run before `"` followed immediately by `'`.
+    /// Without `'` in the suspicious set, the scanner closes the string at `\\"`
+    /// and leaves `':=` as raw tokens outside any string, causing tree-sitter to
+    /// produce an ERROR node and the obfuscator to return the source unchanged.
+    ///
+    /// `'` is safe to add because a bare apostrophe can never directly follow a
+    /// Java string close without an operator in between.
+    #[test]
+    fn consume_string_apostrophe_after_corrupt_quote_is_suspicious() {
+        // After sanitize_structural: {}\\"\':= becomes {}\\\"':=
+        // The \\" before ' must be treated as embedded (apostrophe is suspicious).
+        let src = "p.rot13(\"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890{}\\\\\"':=\")";
+        let (blanked, store) = blank_literals(src);
+        assert_eq!(
+            store.entries.len(),
+            1,
+            "string ending in backslash-quote-apostrophe must be one literal, not split at the apostrophe"
+        );
+        assert!(blanked.contains("p.rot13"), "method call must survive");
         assert_eq!(
             restore_literals(&blanked, &store),
             src,

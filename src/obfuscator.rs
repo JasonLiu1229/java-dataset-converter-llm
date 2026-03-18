@@ -1404,4 +1404,42 @@ mod tests {
             ),
         );
     }
+
+    #[test]
+    fn test_testclass10150_identifiers_renamed_despite_apostrophe_after_corrupt_quote() {
+        // This is what full_sanitize (sanitize_structural) produces from the raw file.
+        // The raw file had \\' (escaped apostrophe) which becomes plain ' here.
+        let input = concat!(
+            "public class TestClass10150 {\n",
+            "@Test public void rot13() {",
+            " Provisioner p = new Provisioner();",
+            " String result = p.rot13(\"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890{}\\\\\"':=\");",
+            " Assert.assertEquals(\"nopqrstuvwxyzabcdefghijklmNOPQRSTUVWXYZABCDEFGHIJKLM1234567890{}\\\\\"':=\", result);",
+            " }\n}",
+        );
+
+        let result = super::obfuscate_str(input).expect("obfuscate_str must not fail");
+
+        // Method name must be renamed.
+        assert!(
+            !result.contains("rot13()"),
+            "method 'rot13' must be renamed to func_N"
+        );
+
+        // Local variables must be renamed.
+        assert!(
+            !result.contains("Provisioner p"),
+            "local 'p' must be renamed"
+        );
+        assert!(
+            !result.contains("String result"),
+            "local 'result' must be renamed"
+        );
+
+        // Literal count must be preserved (guards against re-introducing the split).
+        assert_literal_count_preserved("10150-style", input);
+
+        // Sanity: output must differ from input.
+        assert_ne!(result, input, "obfuscation must have changed the source");
+    }
 }
