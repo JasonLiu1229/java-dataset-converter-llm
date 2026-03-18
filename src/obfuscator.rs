@@ -7,7 +7,7 @@ use std::io;
 use tree_sitter::{Node, Parser};
 
 use crate::literal_blanker::{blank_literals, restore_literals};
-use crate::sanitizer::{sanitize_backslashes, sanitize_structural};
+use crate::sanitizer::sanitize_structural;
 
 #[derive(Debug, Clone)]
 struct Replacement {
@@ -679,11 +679,13 @@ fn obfuscate_code(java_code: &str) -> String {
 }
 
 pub fn obfuscate_str(sanitized_src: &str) -> io::Result<String> {
-    // Dataset files often contain over-escaped `\\"` sequences (double-backslash + quote)
-    // from a previous JSONL encoding pass.  Normalise them to `\"` BEFORE blanking so
-    // that consume_string_literal never closes a string too early at a `\\"` boundary.
-    let src = sanitize_backslashes(sanitized_src);
-    let (blanked, store) = blank_literals(&src);
+    // `blank_literals` / `consume_string_literal` already handles all backslash
+    // escape sequences correctly via the corruption-recovery heuristic.
+    // Calling `sanitize_backslashes` here would change the literal structure of
+    // the obfuscated output relative to `sanitized_original`, causing
+    // `fix_string_literals` to see different literal counts on each side and
+    // fail with "String literal count mismatch".
+    let (blanked, store) = blank_literals(sanitized_src);
     let func_name_obfuscated = obfuscate_function_names(&blanked);
     let obfuscated_blanked = obfuscate_code(&func_name_obfuscated);
     Ok(restore_literals(&obfuscated_blanked, &store))
@@ -1279,6 +1281,127 @@ mod tests {
         assert_ne!(
             result, sanitized,
             "output must differ from sanitized input — obfuscation must have run"
+        );
+    }
+
+    fn count_string_literals(src: &str) -> usize {
+        fn suspicious(b: u8) -> bool {
+            matches!(
+                b,
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'{'
+                    | b'}'
+                    | b':'
+                    | b','
+                    | b'['
+                    | b']'
+                    | b'_'
+                    | b'$'
+                    | b'\\'
+            )
+        }
+        let bytes = src.as_bytes();
+        let mut count = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'"' {
+                count += 1;
+                i += 1;
+                loop {
+                    if i >= bytes.len() {
+                        break;
+                    }
+                    match bytes[i] {
+                        b'\\' => {
+                            let rs = i;
+                            while i < bytes.len() && bytes[i] == b'\\' {
+                                i += 1;
+                            }
+                            let rl = i - rs;
+                            if i < bytes.len() && bytes[i] == b'"' {
+                                let next = bytes.get(i + 1).copied().unwrap_or(b' ');
+                                if rl % 2 == 0 && suspicious(next) {
+                                    i += 1;
+                                } else if rl % 2 == 0 {
+                                    i += 1;
+                                    break;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => {
+                            i += 1;
+                        }
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+
+    fn assert_literal_count_preserved(label: &str, src: &str) {
+        let result = super::obfuscate_str(src)
+            .unwrap_or_else(|e| panic!("{}: obfuscate_str failed: {}", label, e));
+        let before = count_string_literals(src);
+        let after = count_string_literals(&result);
+        assert_eq!(
+            before, after,
+            "{}: obfuscate_str changed the string literal count from {} to {}.\n\
+             This will cause 'String literal count mismatch' in generate_jsonl_from_strings.\n\
+             A likely cause is that sanitize_backslashes was re-added to obfuscate_str.",
+            label, before, after
+        );
+    }
+
+    #[test]
+    fn obfuscate_str_preserves_literal_count_plain() {
+        assert_literal_count_preserved(
+            "plain",
+            concat!(
+                "public class T {\n",
+                "@Test public void testFoo() {",
+                " String s = \"hello\"; assertEquals(\"hello\", s);",
+                " }\n}",
+            ),
+        );
+    }
+    /// TestClass11957 pattern: JSON array with `\\"` before comma and bracket.
+    #[test]
+    fn obfuscate_str_preserves_literal_count_json_array() {
+        assert_literal_count_preserved(
+            "11957-style",
+            concat!(
+                "public class TestClass11957 {\n",
+                "@Test public void testWriteToJson() throws Exception {",
+                " String result = Serialization.getJsonMapper().writeValueAsString(ttm);",
+                " assertThat(result, equalTo(\"{\\\\\"4\\\\\":[\\\\\"abcd\\\\\",\\\\\"adcb\\\\\"],\\\\\"5\\\\\":[\\\\\"deff\\\\\"]}\"));",
+                " }\n}",
+            ),
+        );
+    }
+
+    /// TestClass12696 pattern: valid `"\\\\"` (string value = `\\`).
+    /// `sanitize_backslashes` would corrupt this to `"\\"` (unterminated).
+    #[test]
+    fn obfuscate_str_preserves_literal_count_valid_double_backslash() {
+        assert_literal_count_preserved(
+            "12696-style",
+            concat!(
+                "public class TestClass12696 {\n",
+                "@Test public void testBackslash() {",
+                " BasePlaceholder p = new TestPlaceholder(\"%s\", \"\\\\\\\\\");",
+                " assertThat(p.process(\"%s\")).isEqualTo(\"\\\\\\\\\");",
+                " }\n}",
+            ),
         );
     }
 }
