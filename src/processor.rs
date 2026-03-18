@@ -1,5 +1,5 @@
 use crate::literal_blanker::blank_literals_permanently;
-use crate::sanitizer::{sanitize_backslashes, sanitize_structural};
+use crate::sanitizer::sanitize_structural;
 use serde::Serialize;
 use std::fs;
 use std::fs::File;
@@ -14,11 +14,12 @@ struct PromptResponse {
 
 /// Write a JSONL training pair from in-memory source strings.
 ///
-/// Both sides go through `sanitize_backslashes` first to collapse any
-/// over-encoded `\\"` sequences into valid `\"`, then
-/// `blank_literals_permanently` replaces every string/char literal with
-/// `"_"` / `'X'`. This order matters: blanking before normalisation would
-/// leave corrupt `\\"` patterns splitting string boundaries incorrectly.
+/// Both sides have string/char literals permanently replaced with `"_"` /
+/// `'X'` by `blank_literals_permanently`. The blanker's corruption-recovery
+/// heuristic handles over-encoded `\\"` sequences natively, so
+/// `sanitize_backslashes` is intentionally NOT applied before blanking —
+/// it would destroy valid Java strings ending in even backslash runs
+/// (e.g. `"\\\\"`, whose value is `\\`) by collapsing the trailing `\\\\"`.
 pub fn generate_jsonl_from_strings(
     original_src: &str,
     obfuscated_src: &str,
@@ -31,8 +32,8 @@ pub fn generate_jsonl_from_strings(
         ));
     }
 
-    let prompt = blank_literals_permanently(&sanitize_backslashes(obfuscated_src));
-    let response = blank_literals_permanently(&sanitize_backslashes(original_src));
+    let prompt = blank_literals_permanently(obfuscated_src);
+    let response = blank_literals_permanently(original_src);
 
     if prompt.trim().is_empty() {
         return Err(std::io::Error::new(
@@ -536,5 +537,76 @@ mod tests {
             prompt.contains("\"_\"") && response.contains("\"_\""),
             "both sides must have dummy string literals"
         );
+    }
+
+    /// Regression: TestClass12696 — valid Java string ending in even backslash run.
+    ///
+    /// The source contains `"\\\\"` (4 backslashes in the file = Java value `\\`).
+    /// `sanitize_backslashes` collapses the trailing `\\\\"` pattern, destroying
+    /// the string boundary and causing the blanker to produce garbage like
+    /// `"_"%s"_"\\"_"` in the response. The fix: never run `sanitize_backslashes`
+    /// before `blank_literals_permanently` — the blanker's even/odd heuristic
+    /// handles both valid and corrupt patterns correctly on its own.
+    #[test]
+    fn test_testclass12696_valid_double_backslash_string_blanked_correctly() {
+        // Java source: new TestPlaceholder("%s", "\\\\")
+        // File bytes for second arg: "\\\\" = 4 backslashes + closing quote (valid Java, value = \\)
+        let original_source = concat!(
+            "public class TestClass12696 {\n",
+            "@Test public void testProcessShouldHandleBackslashesCorrectly() {",
+            " BasePlaceholder underTest = new TestPlaceholder(\"%s\", \"\\\\\\\\\");",
+            " String result = underTest.process(\"%s\");",
+            " assertThat(result).isEqualTo(\"\\\\\\\\\");",
+            " }\n}",
+        );
+        let obfuscated_source = concat!(
+            "public class TestClass12696 {\n",
+            "@Test public void func_1() {",
+            " BasePlaceholder var_1 = new TestPlaceholder(\"%s\", \"\\\\\\\\\");",
+            " String var_2 = var_1.process(\"%s\");",
+            " assertThat(var_2).isEqualTo(\"\\\\\\\\\");",
+            " }\n}",
+        );
+
+        let out = NamedTempFile::new().unwrap();
+        let out_path = format!("{}.jsonl", out.path().display());
+        generate_jsonl_from_strings(original_source, obfuscated_source, &out_path)
+            .expect("generate_jsonl_from_strings must not fail");
+
+        let jsonl = fs::read_to_string(&out_path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(jsonl.trim()).expect("output must be valid JSON");
+
+        let prompt = parsed["prompt"].as_str().unwrap();
+        let response = parsed["response"].as_str().unwrap();
+
+        // Both sides must have only clean dummy literals — no backslash garbage between them.
+        assert!(
+            prompt.contains("\"_\""),
+            "prompt must contain dummy string literals"
+        );
+        assert!(
+            response.contains("\"_\""),
+            "response must contain dummy string literals"
+        );
+        assert!(
+            !prompt.contains("\\\\"),
+            "prompt must not contain raw backslash content outside a string: {prompt}"
+        );
+        assert!(
+            !response.contains("\\\\"),
+            "response must not contain raw backslash content outside a string: {response}"
+        );
+
+        // Identifiers must be correct on each side.
+        assert!(
+            prompt.contains("func_1"),
+            "prompt must contain obfuscated method name"
+        );
+        assert!(
+            response.contains("testProcessShouldHandleBackslashesCorrectly"),
+            "response must contain original method name"
+        );
+        assert_ne!(prompt, response, "prompt and response must differ");
     }
 }
