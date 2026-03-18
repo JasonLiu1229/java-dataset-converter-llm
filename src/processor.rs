@@ -1,4 +1,4 @@
-use crate::literal_blanker::blank_literals_permanently;
+use crate::obfuscator::blank_source;
 use crate::sanitizer::sanitize_structural;
 use serde::Serialize;
 use std::fs;
@@ -15,11 +15,12 @@ struct PromptResponse {
 /// Write a JSONL training pair from in-memory source strings.
 ///
 /// Both sides have string/char literals permanently replaced with `"_"` /
-/// `'X'` by `blank_literals_permanently`. The blanker's corruption-recovery
-/// heuristic handles over-encoded `\\"` sequences natively, so
-/// `sanitize_backslashes` is intentionally NOT applied before blanking —
-/// it would destroy valid Java strings ending in even backslash runs
-/// (e.g. `"\\\\"`, whose value is `\\`) by collapsing the trailing `\\\\"`.
+/// `'X'` via `blank_source`, which mirrors `obfuscate_str`'s blanking logic:
+/// it attempts `blank_literals_permanently` directly, then retries with
+/// `sanitize_backslashes` if tree-sitter reports parse errors. This guarantees
+/// both sides produce the same number of `"_"` literals even when the source
+/// contains corrupt `\\"` sequences or valid strings ending in even backslash
+/// runs like `"\\\\"`.
 pub fn generate_jsonl_from_strings(
     original_src: &str,
     obfuscated_src: &str,
@@ -32,8 +33,8 @@ pub fn generate_jsonl_from_strings(
         ));
     }
 
-    let prompt = blank_literals_permanently(obfuscated_src);
-    let response = blank_literals_permanently(original_src);
+    let prompt = blank_source(obfuscated_src);
+    let response = blank_source(original_src);
 
     if prompt.trim().is_empty() {
         return Err(std::io::Error::new(
@@ -605,6 +606,160 @@ mod tests {
         );
         assert!(
             response.contains("testProcessShouldHandleBackslashesCorrectly"),
+            "response must contain original method name"
+        );
+        assert_ne!(prompt, response, "prompt and response must differ");
+    }
+
+    /// Regression: TestClass15410 — HTML string content leaking out of blanked literals.
+    ///
+    /// The original source has a long HTML string like `"<html>...<p>One</p>...</html>"`.
+    /// The heuristic in `blank_literals_permanently` closes strings early when the byte
+    /// after a `\\"` is non-suspicious (e.g. `>`, `<`, space). Since the HTML contains
+    /// no backslash-quote sequences this shouldn't trigger — but the real issue is that
+    /// without the parse-error fallback, ANY corrupt source that produces ERROR nodes
+    /// goes undetected. `blank_source` uses tree-sitter to detect failures and retries,
+    /// guaranteeing both sides have matching `"_"` counts.
+    #[test]
+    fn test_testclass15410_html_string_blanked_symmetrically() {
+        let original_source = concat!(
+            "public class TestClass15410 {\n",
+            "@Test public void testClone() {",
+            " Document doc = Jsoup.parse(\"<html><head><title>Hello</title></head><body><p>One</p><p>Two</p></body></html>\");",
+            " Document clone = doc.clone();",
+            " assertEquals(\"<html><head><title>Hello</title> </head><body><p>One</p><p>Two</p></body></html>\", TextUtil.stripNewlines(clone.html()));",
+            " clone.title(\"Hello\");",
+            " clone.select(\"p\").first().text(\"One more\").attr(\"id\", \"1\");",
+            " assertEquals(\"<html><head><title>Hello</title></head><body><p id=\\\"1\\\">One more</p><p>Two</p></body></html>\", TextUtil.stripNewlines(clone.html()));",
+            " assertEquals(\"<html><head><title>Hello</title> </head><body><p>One</p><p>Two</p></body></html>\", TextUtil.stripNewlines(doc.html()));",
+            " }\n}",
+        );
+        let obfuscated_source = concat!(
+            "public class TestClass15410 {\n",
+            "@Test public void func_1() {",
+            " Document var_1 = Jsoup.parse(\"<html><head><title>Hello</title></head><body><p>One</p><p>Two</p></body></html>\");",
+            " Document var_2 = var_1.clone();",
+            " assertEquals(\"<html><head><title>Hello</title> </head><body><p>One</p><p>Two</p></body></html>\", TextUtil.stripNewlines(var_2.html()));",
+            " var_2.title(\"Hello\");",
+            " var_2.select(\"p\").first().text(\"One more\").attr(\"id\", \"1\");",
+            " assertEquals(\"<html><head><title>Hello</title></head><body><p id=\\\"1\\\">One more</p><p>Two</p></body></html>\", TextUtil.stripNewlines(var_2.html()));",
+            " assertEquals(\"<html><head><title>Hello</title> </head><body><p>One</p><p>Two</p></body></html>\", TextUtil.stripNewlines(var_1.html()));",
+            " }\n}",
+        );
+
+        let out = NamedTempFile::new().unwrap();
+        let out_path = format!("{}.jsonl", out.path().display());
+        generate_jsonl_from_strings(original_source, obfuscated_source, &out_path)
+            .expect("generate_jsonl_from_strings must not fail");
+
+        let jsonl = fs::read_to_string(&out_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(jsonl.trim()).unwrap();
+        let prompt = parsed["prompt"].as_str().unwrap();
+        let response = parsed["response"].as_str().unwrap();
+
+        // Count "_" occurrences — both sides must match.
+        let prompt_count = prompt.matches("\"_\"").count();
+        let response_count = response.matches("\"_\"").count();
+        assert_eq!(
+            prompt_count, response_count,
+            "both sides must have the same number of dummy literals (prompt={prompt_count}, response={response_count})"
+        );
+        assert!(prompt_count > 0, "must have at least one blanked literal");
+
+        // No raw HTML must survive outside a string.
+        assert!(
+            !response.contains("<html>"),
+            "HTML content must not leak outside string boundaries in response"
+        );
+        assert!(
+            !prompt.contains("<html>"),
+            "HTML content must not leak outside string boundaries in prompt"
+        );
+
+        assert!(
+            prompt.contains("func_1"),
+            "prompt must contain obfuscated method name"
+        );
+        assert!(
+            response.contains("testClone"),
+            "response must contain original method name"
+        );
+        assert_ne!(prompt, response, "prompt and response must differ");
+    }
+
+    /// Regression: TestClass21169 — format string with `%s` after a corrupt `\\"` sequence.
+    ///
+    /// The original source contains `String.format("%s\"some text\"", ...)` where the
+    /// string argument has `\\"` (two backslashes + bare quote) as a corruption artifact.
+    /// The heuristic closes the string at `\\"` followed by `%` because `%` is not in
+    /// the suspicious set, leaving `%s\\"_"` as raw tokens. `blank_source` detects the
+    /// resulting parse errors and retries with `sanitize_backslashes`, producing clean
+    /// `"_"` on both sides.
+    #[test]
+    fn test_testclass21169_format_string_with_corrupt_backslash_quote_blanked_correctly() {
+        // The string argument "%s\\\"%s\\\"" simulates the corrupt pattern:
+        // \\\\ = two backslashes in file, then \" = a bare quote (corrupt)
+        let original_source = concat!(
+            "public class TestClass21169 {\n",
+            "@Test public void testGetExpressionVariableAsBooleanRequiredBlankValue() {",
+            " Expression expression = mock(Expression.class);",
+            " DelegateExecution execution = mock(DelegateExecution.class);",
+            " when(expression.getValue(execution)).thenReturn(BLANK_TEXT);",
+            " try {",
+            " activitiHelper.getExpressionVariableAsBoolean(expression, execution, VARIABLE_NAME, VARIABLE_REQUIRED, NO_BOOLEAN_DEFAULT_VALUE);",
+            " fail();",
+            " } catch (IllegalArgumentException e) {",
+            " assertEquals(String.format(\"%s\\\\\"variable '%s' is required\\\\\"\", VARIABLE_NAME), e.getMessage());",
+            " } }\n}",
+        );
+        let obfuscated_source = concat!(
+            "public class TestClass21169 {\n",
+            "@Test public void func_1() {",
+            " Expression var_1 = mock(Expression.class);",
+            " DelegateExecution var_2 = mock(DelegateExecution.class);",
+            " when(var_1.getValue(var_2)).thenReturn(BLANK_TEXT);",
+            " try {",
+            " activitiHelper.getExpressionVariableAsBoolean(var_1, var_2, VARIABLE_NAME, VARIABLE_REQUIRED, NO_BOOLEAN_DEFAULT_VALUE);",
+            " fail();",
+            " } catch (IllegalArgumentException e) {",
+            " assertEquals(String.format(\"%s\\\\\"variable '%s' is required\\\\\"\", VARIABLE_NAME), e.getMessage());",
+            " } }\n}",
+        );
+
+        let out = NamedTempFile::new().unwrap();
+        let out_path = format!("{}.jsonl", out.path().display());
+        generate_jsonl_from_strings(original_source, obfuscated_source, &out_path)
+            .expect("generate_jsonl_from_strings must not fail");
+
+        let jsonl = fs::read_to_string(&out_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(jsonl.trim()).unwrap();
+        let prompt = parsed["prompt"].as_str().unwrap();
+        let response = parsed["response"].as_str().unwrap();
+
+        let prompt_count = prompt.matches("\"_\"").count();
+        let response_count = response.matches("\"_\"").count();
+        assert_eq!(
+            prompt_count, response_count,
+            "both sides must have the same number of dummy literals (prompt={prompt_count}, response={response_count})"
+        );
+        assert!(prompt_count > 0, "must have at least one blanked literal");
+
+        // No format specifier or corrupt backslash sequence must leak outside a string.
+        assert!(
+            !response.contains("%s\\"),
+            "corrupt backslash-quote must not leak outside string in response"
+        );
+        assert!(
+            !prompt.contains("%s\\"),
+            "corrupt backslash-quote must not leak outside string in prompt"
+        );
+
+        assert!(
+            prompt.contains("func_1"),
+            "prompt must contain obfuscated method name"
+        );
+        assert!(
+            response.contains("testGetExpressionVariableAsBooleanRequiredBlankValue"),
             "response must contain original method name"
         );
         assert_ne!(prompt, response, "prompt and response must differ");
