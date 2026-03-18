@@ -28,23 +28,42 @@ pub fn generate_jsonl_from_strings(
     //
     // Phase 2: fix_string_literals — copies the prompt's literal contents into
     //   the response wherever they differ.  Obfuscation only renames identifiers,
-    //   so any content difference in a literal is dataset corruption.  Must run
-    //   BEFORE sanitize_backslashes because step 3 collapses backslash runs
-    //   context-free; corrupt runs get collapsed differently from clean ones.
+    //   so any content difference in a literal is dataset corruption.
     //
-    // Phase 3: sanitize_backslashes — both sides now have identical literal
-    //   contents, so this step applies identically to both and token counts
-    //   stay in sync.
-    let original_src = fix_string_literals(obfuscated_src, original_src).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "String literal count mismatch between prompt and response — \
+    //   Two-attempt strategy:
+    //   Attempt 1 — run without normalisation (original behaviour).  This works
+    //   for the common case and for files whose corrupt literals have large even
+    //   backslash runs (e.g. 10-backslash + closing quote) that must be repaired
+    //   by copying the clean literal from the prompt BEFORE sanitize_backslashes
+    //   collapses them into orphaned embedded quotes.
+    //
+    //   Attempt 2 — if attempt 1 returns None (literal-count mismatch), apply
+    //   sanitize_backslashes to BOTH sides first and retry.  This handles the
+    //   case where obfuscate_str's parse-error fallback has already applied
+    //   sanitize_backslashes internally: the obfuscated output has 1bs+quote
+    //   where the original still has 2bs+quote, so the literal counts differ
+    //   without normalisation but match after both sides are normalised.
+    //
+    // Phase 3: sanitize_backslashes — normalises residual over-encoded runs.
+    //   Applied after fix_string_literals so it sees identical content on both
+    //   sides and never changes relative token counts.
+    let repaired_original = fix_string_literals(obfuscated_src, original_src)
+        .or_else(|| {
+            // Attempt 2: normalise both sides and retry.
+            let obf_norm = sanitize_backslashes(obfuscated_src);
+            let ori_norm = sanitize_backslashes(original_src);
+            fix_string_literals(&obf_norm, &ori_norm)
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "String literal count mismatch between prompt and response — \
                  cannot repair corrupt pair",
-        )
-    })?;
+            )
+        })?;
 
     let obfuscated_code = sanitize_backslashes(obfuscated_src);
-    let original_code = sanitize_backslashes(&original_src);
+    let original_code = sanitize_backslashes(&repaired_original);
 
     if obfuscated_code.trim().is_empty() {
         return Err(std::io::Error::new(

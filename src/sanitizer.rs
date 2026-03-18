@@ -60,7 +60,17 @@ pub fn sanitize_structural(src: &str) -> String {
     let after_unicode = fix_json_unicode_escapes(&after_cr_null);
 
     // ── 2. Escaped single-quotes  \'  →  '  ─────────────────────────────────
-    fix_escaped_single_quotes(&after_unicode)
+    let after_sq = fix_escaped_single_quotes(&after_unicode);
+
+    // ── 3. Raw newlines / CRs inside string literals  →  \n / \r  ───────────
+    // A bare 0x0A inside a Java string literal is invalid Java; it prevents
+    // tree-sitter from building a clean AST and causes obfuscate_str to
+    // silently produce zero identifier renames (prompt == response in JSONL).
+    // This step must run AFTER the CRLF pass (so lone \r is already gone from
+    // inter-token whitespace) but BEFORE sanitize_backslashes, because the
+    // two new backslashes it emits are valid Java escape characters that the
+    // backslash normaliser must not collapse.
+    fix_raw_newlines_in_string_literals(&after_sq)
 }
 
 /// Phase 2 — over-escaped backslashes before double-quotes.
@@ -210,6 +220,159 @@ pub fn fix_string_literals(prompt: &str, response: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Fix bare newline / carriage-return characters that appear **inside** a
+/// double-quoted Java string literal.
+///
+/// A raw `\n` (0x0A) or `\r` (0x0D) inside a Java string literal is invalid
+/// Java — string literals cannot span lines.  EvoSuite sometimes writes test
+/// files where the string content contains a real newline (e.g. when the
+/// method under test produces multi-line output).  These raw newlines prevent
+/// tree-sitter from building a clean AST for the file, which causes
+/// `obfuscate_str` to silently return the source unchanged (zero identifier
+/// renames → `prompt == response` in the JSONL pair).
+///
+/// Fix: replace each bare `\n` with the two-character escape `\n` and each
+/// bare `\r` with `\r` *inside string literals only*.  Outside string literals
+/// newlines are meaningful Java whitespace and must be left alone.
+///
+/// The scanner uses the same backslash-run logic as `consume_string_literal`
+/// in `literal_blanker`: an odd run of backslashes before `"` means an
+/// embedded escaped quote (keep scanning); an even run or a bare `"` closes
+/// the string.
+/// Returns `true` for bytes that cannot validly appear immediately after a
+/// closing `"` in well-formed Java source (same heuristic as
+/// `literal_blanker::is_suspicious_after_even_backslash_close`).
+///
+/// Used by `fix_raw_newlines_in_string_literals` so that its string-boundary
+/// detection stays in sync with `blank_literals` / `consume_string_literal`.
+#[inline]
+fn is_suspicious_close(b: u8) -> bool {
+    matches!(
+        b,
+        b'a'..=b'z'
+        | b'A'..=b'Z'
+        | b'0'..=b'9'
+        | b'{'
+        | b'}'
+        | b':'
+        | b','
+        | b'['
+        | b']'
+        | b'\''   // apostrophe — never directly follows a Java string close
+        | b'_'
+        | b'$'
+        | b'\\'
+    )
+}
+
+fn fix_raw_newlines_in_string_literals(src: &str) -> String {
+    // Fast path: if there is no double-quote in the source there are no string
+    // literals to inspect, and if there are no raw newlines inside a quoted
+    // region there is nothing to do.
+    if !src.contains('"') {
+        return src.to_string();
+    }
+
+    let bytes = src.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+
+    while i < n {
+        if bytes[i] == b'"' {
+            // ── Enter a string literal ──────────────────────────────────────
+            out.push('"');
+            i += 1;
+
+            loop {
+                if i >= n {
+                    break;
+                }
+                match bytes[i] {
+                    b'\\' => {
+                        // Count the full backslash run so we can determine
+                        // whether the following `"` (if any) is escaped.
+                        let run_start = i;
+                        while i < n && bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        let run_len = i - run_start;
+
+                        // Emit all backslashes verbatim.
+                        for _ in 0..run_len {
+                            out.push('\\');
+                        }
+
+                        if i < n && bytes[i] == b'"' {
+                            if run_len % 2 == 1 {
+                                // Odd run → the last `\` escapes the `"`;
+                                // it is an embedded character, keep scanning.
+                                out.push('"');
+                                i += 1;
+                            } else {
+                                // Even run + `"`: apply the same
+                                // corruption-recovery heuristic as
+                                // `consume_string_literal`: if the byte
+                                // immediately after the `"` looks like it
+                                // cannot start a valid Java token after a
+                                // string close, treat the `"` as an embedded
+                                // escaped quote and keep scanning.
+                                let next = bytes.get(i + 1).copied().unwrap_or(b' ');
+                                if is_suspicious_close(next) {
+                                    // Spurious close — treat as embedded, continue.
+                                    out.push('"');
+                                    i += 1;
+                                } else {
+                                    // Real closing quote.
+                                    out.push('"');
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                        }
+                        // If not followed by `"` the run is part of the
+                        // string content (e.g. `\\n`, `\\t`); continue.
+                    }
+                    b'"' => {
+                        // Bare closing quote — end of literal.
+                        out.push('"');
+                        i += 1;
+                        break;
+                    }
+                    b'\n' => {
+                        // Raw newline inside a string literal → escape it.
+                        out.push('\\');
+                        out.push('n');
+                        i += 1;
+                    }
+                    b'\r' => {
+                        // Raw carriage-return inside a string literal.
+                        // If followed by \n the pair was already collapsed to
+                        // \n by the CRLF pass, so we only see a lone \r here.
+                        out.push('\\');
+                        out.push('r');
+                        i += 1;
+                    }
+                    _ => {
+                        // Copy a full UTF-8 char at once.
+                        let ch = src[i..].chars().next().unwrap_or('\0');
+                        out.push(ch);
+                        i += ch.len_utf8();
+                    }
+                }
+            }
+        } else {
+            // Outside a string literal — copy verbatim (including newlines,
+            // which are meaningful Java whitespace here).
+            let ch = src[i..].chars().next().unwrap_or('\0');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+
+    out
+}
 
 fn fix_escaped_single_quotes(src: &str) -> String {
     let bytes = src.as_bytes();
@@ -663,6 +826,112 @@ mod tests {
             spans.len(),
             3,
             "TestClass10859-style source must produce 3 literal spans, not more"
+        );
+    }
+
+    // ── fix_raw_newlines_in_string_literals tests ────────────────────────────
+
+    #[test]
+    fn raw_newline_inside_string_is_escaped() {
+        // Simulates the TestClass10179 case: a real 0x0A inside a string literal.
+        let input = "assertHttpResponse(request, 200, \"{\n \"name\" : \"test1\"\n}\");";
+        let result = super::sanitize_structural(input);
+        assert!(
+            !result.contains("\"\n"),
+            "no bare newline must remain inside a string literal"
+        );
+        assert!(
+            result.contains("\\n"),
+            "bare newline must be replaced with \\n escape"
+        );
+    }
+
+    /// Regression: TestClass10179.
+    ///
+    /// The raw Java contains `{\\n \"name\" : \"test1\"\\n}` as a string literal
+    /// where `\\n` is a real 0x0A newline byte and `\"` is a literal backslash+quote
+    /// pair (i.e. `\\` followed by `"`, an even backslash run).
+    ///
+    /// Before this fix, `fix_raw_newlines_in_string_literals` used simple even/odd
+    /// logic and treated `\\"` as a closing quote, splitting the string early.
+    /// After the fix the corruption-recovery heuristic is applied: an even backslash
+    /// run before `"` is treated as spurious when the next byte looks suspicious
+    /// (e.g. `n` for `name`), so the bare `\n` inside it is correctly escaped.
+    #[test]
+    fn raw_newline_with_corrupt_even_backslash_quote_inside_string_is_escaped() {
+        let input = concat!(
+            "public class TestClass10179 {\n",
+            "@Test public void should_provide_etag() throws Exception {",
+            " HttpRequest request = client().GET(\"/api/etag/test1\");",
+            " assertHttpResponse(request, 200, \"{\n \\\"name\\\" : \\\"test1\\\"\\n}\");",
+            " assertThat(request.header(\"ETag\")).isEqualTo(\"5a105e8b9d40e1329780d62ea2265d8a\");",
+            " }\n}",
+        );
+        let result = super::sanitize_structural(input);
+
+        assert!(
+            !result.contains("\"\n"),
+            "no bare newline must remain inside a string literal after sanitization"
+        );
+        assert!(
+            result.contains("\\n"),
+            "bare newlines must be replaced with \\n escape"
+        );
+        assert!(
+            result.contains("should_provide_etag"),
+            "method name must survive sanitize_structural"
+        );
+        assert!(
+            result.contains("request"),
+            "variable name must survive sanitize_structural"
+        );
+    }
+
+    #[test]
+    fn raw_newline_outside_string_is_preserved() {
+        // Newlines between statements are valid Java whitespace — must not be touched.
+        let input = "public class T {\n@Test public void m() {\nint x = 1;\n}\n}";
+        let result = super::sanitize_structural(input);
+        assert_eq!(
+            result, input,
+            "newlines outside string literals must be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn raw_newline_in_string_does_not_break_identifier_visibility() {
+        // Full class matching the TestClass10179 shape.
+        let input = concat!(
+            "public class TestClass10179 {\n",
+            "@Test public void should_provide_etag() throws Exception {",
+            " HttpRequest request = client().GET(\"/api/etag/test1\");",
+            " assertHttpResponse(request, 200, \"{\n \\\"name\\\" : \\\"test1\\\"\\n}\");",
+            " assertThat(request.header(\"ETag\")).isEqualTo(\"5a105e8b9d40e1329780d62ea2265d8a\");",
+            " }\n}",
+        );
+        let result = super::sanitize_structural(input);
+        assert!(
+            result.contains("should_provide_etag"),
+            "method name must survive sanitization"
+        );
+        assert!(
+            result.contains("request"),
+            "variable name must survive sanitization"
+        );
+        assert!(
+            !result.contains("\"\n"),
+            "no bare newline must remain inside a string literal after sanitization"
+        );
+    }
+
+    #[test]
+    fn valid_escaped_newline_in_string_is_unchanged() {
+        // A properly-escaped \\n (two chars: backslash + n) must NOT be doubled.
+        let input = "String s = \"{\\\\n \\\"name\\\" : \\\"test1\\\"\\\\n}\";";
+        let result = super::sanitize_structural(input);
+        assert_eq!(
+            result, input,
+            "a valid \\\\n escape sequence must be left unchanged"
         );
     }
 }

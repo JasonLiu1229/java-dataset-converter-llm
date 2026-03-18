@@ -8,7 +8,7 @@ use std::io;
 use tree_sitter::{Node, Parser};
 
 use crate::literal_blanker::{blank_literals, restore_literals};
-use crate::sanitizer::sanitize_structural;
+use crate::sanitizer::{sanitize_backslashes, sanitize_structural};
 
 thread_local! {
     static PARSER: RefCell<Parser> = RefCell::new({
@@ -665,17 +665,56 @@ fn obfuscate_code(java_code: &str) -> String {
     apply_replacements(java_code, &replacements)
 }
 
+/// Returns `true` if the tree-sitter parse tree for `src` contains any ERROR
+/// nodes, indicating that the source is not valid Java.
+fn has_parse_errors(src: &str) -> bool {
+    PARSER.with(|p| {
+        p.borrow_mut()
+            .parse(src, None)
+            .map(|t| t.root_node().has_error())
+            .unwrap_or(true)
+    })
+}
+
 pub fn obfuscate_str(sanitized_src: &str) -> io::Result<String> {
-    // `blank_literals` / `consume_string_literal` already handles all backslash
-    // escape sequences correctly via the corruption-recovery heuristic.
-    // Calling `sanitize_backslashes` here would change the literal structure of
-    // the obfuscated output relative to `sanitized_original`, causing
-    // `fix_string_literals` to see different literal counts on each side and
-    // fail with "String literal count mismatch".
+    // Some dataset files contain `\\"` (two backslashes + bare quote) produced
+    // by an extra round of JSONL encoding.  Java (and tree-sitter) parses `\\`
+    // as a complete escaped-backslash, then the bare `"` closes the string
+    // early, resulting in ERROR nodes throughout the AST.  When that happens
+    // `walk_methods` silently bails and the obfuscator returns the source
+    // unchanged (prompt == response in the JSONL pair).
+    //
+    // Fix: after blanking the literals, check whether the blanked source has
+    // any parse errors.  If it does, re-run the whole pipeline on a version
+    // that has had `sanitize_backslashes` applied.  `sanitize_backslashes`
+    // collapses `\\"` (2bs+quote) → `\"` (1bs+quote), turning broken string
+    // closes into valid embedded quotes.
+    //
+    // Applying `sanitize_backslashes` unconditionally before blanking would
+    // corrupt valid Java strings like `"\\\\"` (value `\\`, two backslashes):
+    // the trailing `\\"` (last two backslashes + closing quote) would be
+    // collapsed to `\"`, destroying the string.  The try-first / fallback
+    // approach avoids this: valid Java is never ERROR-free after blanking,
+    // so the fallback path is only reached by actually-broken sources.
     let (blanked, store) = blank_literals(sanitized_src);
-    let func_name_obfuscated = obfuscate_function_names(&blanked);
-    let obfuscated_blanked = obfuscate_code(&func_name_obfuscated);
-    Ok(restore_literals(&obfuscated_blanked, &store))
+
+    // Fast path: no parse errors → obfuscate as normal.
+    if !has_parse_errors(&blanked) {
+        let func_name_obfuscated = obfuscate_function_names(&blanked);
+        let obfuscated_blanked = obfuscate_code(&func_name_obfuscated);
+        return Ok(restore_literals(&obfuscated_blanked, &store));
+    }
+
+    // Fallback: the source has ERROR nodes.  Try collapsing over-escaped
+    // backslash-quote sequences and re-blanking.
+    let recovered = sanitize_backslashes(sanitized_src);
+    let (blanked2, store2) = blank_literals(&recovered);
+
+    // Whether or not the second parse is clean, proceed — any improvement
+    // is better than returning the source unchanged.
+    let func_name_obfuscated2 = obfuscate_function_names(&blanked2);
+    let obfuscated_blanked2 = obfuscate_code(&func_name_obfuscated2);
+    Ok(restore_literals(&obfuscated_blanked2, &store2))
 }
 
 /// File-based wrapper kept for CLI tooling that wants obfuscated `.java` files
@@ -1351,5 +1390,53 @@ mod tests {
         );
         assert_literal_count_preserved("10150-style", input);
         assert_ne!(result, input, "obfuscation must have changed the source");
+    }
+
+    /// Regression: TestClass10179.
+    ///
+    /// The raw .java file contains `\\"name\\"` — two backslashes followed by
+    /// a bare double-quote.  Java parses `\\` as a complete escaped-backslash,
+    /// then the bare `"` closes the string early, so tree-sitter produces ERROR
+    /// nodes.  Before the fix, `obfuscate_str` silently returned the input
+    /// unchanged (prompt == response in the JSONL pair).
+    ///
+    /// After the fix, `obfuscate_str` detects the ERROR nodes, retries with
+    /// `sanitize_backslashes` applied (collapsing `\\"` → `\"`), and
+    /// successfully renames all identifiers.
+    #[test]
+    fn test_testclass10179_obfuscates_despite_double_backslash_before_quote() {
+        // This is exactly what the .java file on disk contains:
+        // the \\" sequences are 2 backslashes + bare quote (broken Java).
+        let input = concat!(
+            "public class TestClass10179 {\n",
+            "@Test public void should_provide_etag() throws Exception {",
+            " HttpRequest request = client().GET(\"/api/etag/test1\");",
+            // \\\\ in a Rust string literal = two backslashes in the value = \\"
+            // followed by a bare quote in the source = the broken pattern.
+            " assertHttpResponse(request, 200, \"{\\\\n \\\\\"name\\\\\" : \\\\\"test1\\\\\"\\\\n}\");",
+            " assertThat(request.header(\"ETag\")).isEqualTo(\"5a105e8b9d40e1329780d62ea2265d8a\");",
+            " }\n}",
+        );
+
+        let result = super::obfuscate_str(input).expect("obfuscate_str must not fail");
+
+        assert_ne!(
+            result, input,
+            "obfuscation must have changed the source — \
+             if prompt==response the parse-error fallback did not trigger"
+        );
+        assert!(
+            !result.contains("should_provide_etag"),
+            "method 'should_provide_etag' must be renamed to func_N"
+        );
+        assert!(
+            !result.contains("HttpRequest request"),
+            "local 'request' must be renamed to var_N"
+        );
+        // The string literal content must be preserved (only identifiers renamed).
+        assert!(
+            result.contains("5a105e8b9d40e1329780d62ea2265d8a"),
+            "string literal content must be preserved"
+        );
     }
 }
