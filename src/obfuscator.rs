@@ -1,5 +1,6 @@
 // Disclaimer: Code is made using help of AI, so errors or some things might not be perfect.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -8,6 +9,15 @@ use tree_sitter::{Node, Parser};
 
 use crate::literal_blanker::{blank_literals, restore_literals};
 use crate::sanitizer::sanitize_structural;
+
+thread_local! {
+    static PARSER: RefCell<Parser> = RefCell::new({
+        let mut p = Parser::new();
+        p.set_language(&tree_sitter_java::LANGUAGE.into())
+            .expect("Error loading Java grammar");
+        p
+    });
+}
 
 #[derive(Debug, Clone)]
 struct Replacement {
@@ -81,13 +91,10 @@ fn is_field_node(node: Node, parent: Node, field: &str) -> bool {
 }
 
 fn obfuscate_function_names(java_code: &str) -> String {
-    let mut parser = Parser::new();
-    let language = tree_sitter_java::LANGUAGE;
-    parser
-        .set_language(&language.into())
-        .expect("Error loading Java grammar");
+    // Re-use the thread-local parser instead of creating a new one.
+    let tree = PARSER.with(|p| p.borrow_mut().parse(java_code, None));
 
-    let tree = match parser.parse(java_code, None) {
+    let tree = match tree {
         Some(t) => t,
         None => return java_code.to_string(),
     };
@@ -257,13 +264,10 @@ fn collect_class_fields(
 }
 
 fn obfuscate_code(java_code: &str) -> String {
-    let mut parser = Parser::new();
-    let language = tree_sitter_java::LANGUAGE;
-    parser
-        .set_language(&language.into())
-        .expect("Error loading Java grammar");
+    // Re-use the thread-local parser instead of creating a new one.
+    let tree = PARSER.with(|p| p.borrow_mut().parse(java_code, None));
 
-    let tree = match parser.parse(java_code, None) {
+    let tree = match tree {
         Some(t) => t,
         None => return java_code.to_string(),
     };
@@ -392,9 +396,6 @@ fn obfuscate_code(java_code: &str) -> String {
                     if c.goto_first_child() {
                         loop {
                             let p = c.node();
-                            // Tree-sitter-java may represent lambda params as:
-                            // - identifier (single param)
-                            // - formal_parameter
                             if p.kind() == "formal_parameter" {
                                 if let Some(name_node) = p.child_by_field_name("name") {
                                     declare_identifier(
@@ -448,11 +449,7 @@ fn obfuscate_code(java_code: &str) -> String {
             }
 
             // Enhanced for: for (Type x : expr)
-            // tree-sitter-java exposes the loop variable via the "name" field on
-            // enhanced_for_statement (added in recent grammar versions).  Fall back
-            // to scanning for the last identifier before ":" for older grammars.
             if node.kind() == "enhanced_for_statement" {
-                // Prefer the dedicated "name" field if the grammar exposes it.
                 let name_node_opt = node.child_by_field_name("name");
 
                 if let Some(name_node) = name_node_opt {
@@ -471,7 +468,7 @@ fn obfuscate_code(java_code: &str) -> String {
                         loop {
                             let ch = c.node();
                             if ch.kind() == ":" {
-                                break; // everything after this is the iterable, not the var
+                                break;
                             }
                             if ch.kind() == "identifier" {
                                 last_ident = Some(ch);
@@ -538,11 +535,6 @@ fn obfuscate_code(java_code: &str) -> String {
             }
 
             // Identifier usages (variable references)
-            // node.kind() == "identifier" means it is a plain identifier token.
-            // tree-sitter-java uses "type_identifier" for type names, so plain
-            // "identifier" nodes are always variable/constant references — never
-            // raw type names.  We still guard against a few annotation / label
-            // contexts that are caught by is_non_variable_identifier_context.
             if node.kind() == "identifier" {
                 if !is_non_variable_identifier_context(node) {
                     let start0 = node.start_byte() as usize;
@@ -615,12 +607,7 @@ fn obfuscate_code(java_code: &str) -> String {
         local_var_counter: &mut usize,
         class_scope: &HashMap<String, String>,
     ) {
-        // Do not descend into ERROR nodes.  When tree-sitter cannot parse a
-        // region it wraps it in an ERROR node whose children are flattened
-        // tokens — method_declaration nodes inside it are gone, so we would
-        // produce no renames anyway.  Skipping eagerly avoids emitting
-        // spurious replacements for tokens that only superficially look like
-        // identifiers.
+        // Do not descend into ERROR nodes.
         if node.is_error() {
             return;
         }
@@ -728,7 +715,6 @@ mod tests {
             r#"public class T { public void m() { Listener listener = new Listener("table"); } }"#;
         let func_name_obfuscated = super::obfuscate_function_names(input);
         let result = super::obfuscate_code(&func_name_obfuscated);
-
         assert!(result.contains("= new Listener(\"table\")"));
     }
 
@@ -737,7 +723,6 @@ mod tests {
         let input = r#"public class T { public void m() { int size = 1; foo.size(); } }"#;
         let func_name_obfuscated = super::obfuscate_function_names(input);
         let result = super::obfuscate_code(&func_name_obfuscated);
-
         assert!(result.contains(".size()"));
     }
 
@@ -746,7 +731,6 @@ mod tests {
         let input = r#"public class T { public void m() { int x = 1; { int x = 2; x = x + 1; } x = x + 1; } }"#;
         let func_name_obfuscated = super::obfuscate_function_names(input);
         let result = super::obfuscate_code(&func_name_obfuscated);
-
         assert!(!result.contains(" int x "));
     }
 
@@ -763,7 +747,6 @@ mod tests {
         "#;
         let func_name_obfuscated = super::obfuscate_function_names(input);
         let result = super::obfuscate_code(&func_name_obfuscated);
-
         assert!(result.contains("for (String"));
         assert!(result.contains("catch (Exception"));
     }
@@ -782,7 +765,6 @@ mod tests {
         "#;
         let func_name_obfuscated = super::obfuscate_function_names(input);
         let result = super::obfuscate_code(&func_name_obfuscated);
-
         assert!(
             !result.contains("counter"),
             "field 'counter' should be renamed"
@@ -796,7 +778,7 @@ mod tests {
         public class TestClass77051 {
             private Carte carte;
             private Noeud n1, n3, n5, n7;
- 
+
             @Test public void testFiltreNoeudsSimples() {
                 carte.filtreNoeudsSimples();
                 for (Arc a : carte.getPopArcs()) {
@@ -813,16 +795,13 @@ mod tests {
         let step1 = super::obfuscate_function_names(input);
         let result = super::obfuscate_code(&step1);
 
-        // Method name renamed
         assert!(
             !result.contains("testFiltreNoeudsSimples"),
             "method name should be renamed"
         );
-        // Class fields renamed everywhere
         assert!(!result.contains("carte"), "field 'carte' should be renamed");
         assert!(!result.contains(" n1"), "field 'n1' should be renamed");
         assert!(!result.contains(" n7"), "field 'n7' should be renamed");
-        // For-loop variables renamed
         assert!(
             !result.contains(" a ") && !result.contains("(Arc a"),
             "loop var 'a' should be renamed"
@@ -831,10 +810,8 @@ mod tests {
             !result.contains(" n ") && !result.contains("(Noeud n"),
             "loop var 'n' should be renamed"
         );
-        // Types must NOT be renamed
         assert!(result.contains("Arc"), "type 'Arc' must be preserved");
         assert!(result.contains("Noeud"), "type 'Noeud' must be preserved");
-        // Method calls on objects must NOT be renamed
         assert!(
             result.contains(".filtreNoeudsSimples()"),
             "invoked method name must be preserved"
@@ -873,7 +850,6 @@ mod tests {
             !result.contains(" cell"),
             "inner loop var 'cell' should be renamed"
         );
-        // The two vars should get different names
         let var_names: Vec<&str> = result
             .split_whitespace()
             .filter(|w| w.starts_with("var_"))
@@ -922,12 +898,10 @@ mod tests {
         let step1 = super::obfuscate_function_names(input);
         let result = super::obfuscate_code(&step1);
 
-        // Both `x` variables must be gone
         assert!(
             !result.contains(" x "),
             "local 'x' in both methods should be renamed"
         );
-        // Method names renamed
         assert!(
             !result.contains("first"),
             "method 'first' should be renamed"
@@ -944,7 +918,7 @@ mod tests {
         public class T {
             private int value;
             public void m() {
-                int value = 42;       // shadows field
+                int value = 42;
                 System.out.println(value);
             }
         }
@@ -1068,13 +1042,6 @@ mod tests {
         assert!(!result.contains("mb("), "method 'mb' should be renamed");
     }
 
-    /// Regression test for the failing dataset example with:
-    ///   - final local vars
-    ///   - array-type locals (byte[])
-    ///   - scoped-type locals (BlockHash.Match)
-    ///   - variables used as method-invocation objects (best_match.source_offset())
-    ///   - re-assignment (time = ... - time)
-    ///   - external identifiers that must NOT be renamed (hashed_all_Qs, huge_bh)
     #[test]
     fn test_search_string_finds_too_many_matches() {
         let input = r#"
@@ -1096,13 +1063,10 @@ mod tests {
         let step1 = super::obfuscate_function_names(input);
         let result = super::obfuscate_code(&step1);
 
-        // Method name must be renamed
         assert!(
             !result.contains("SearchStringFindsTooManyMatches"),
             "method name should be renamed"
         );
-
-        // All declared local variables must be renamed
         assert!(
             !result.contains("kTestSize"),
             "final local 'kTestSize' should be renamed"
@@ -1119,13 +1083,10 @@ mod tests {
             !result.contains("elapsed_time_in_us"),
             "local 'elapsed_time_in_us' should be renamed"
         );
-        // 'time' appears in identifiers and string literals - check the declaration form
         assert!(
             !result.contains("long time"),
             "local 'time' declaration should be renamed"
         );
-
-        // External references (undeclared in this class) must be left alone
         assert!(
             result.contains("hashed_all_Qs"),
             "external ref 'hashed_all_Qs' must not be renamed"
@@ -1138,8 +1099,6 @@ mod tests {
             result.contains("huge_bh"),
             "external ref 'huge_bh' must not be renamed"
         );
-
-        // Types and invoked method names must be preserved
         assert!(
             result.contains("BlockHash"),
             "type 'BlockHash' must be preserved"
@@ -1157,6 +1116,7 @@ mod tests {
             "static call must be preserved"
         );
     }
+
     #[test]
     fn test_testclass10186_identifiers_renamed_despite_problematic_string_literals() {
         let input = r#"public class TestClass10186 {
@@ -1165,13 +1125,10 @@ mod tests {
 
         let result = super::obfuscate_str(input).expect("obfuscate_str must not fail");
 
-        // The method name must be renamed.
         assert!(
             !result.contains("should_use_spec"),
             "method 'should_use_spec' must be renamed"
         );
-
-        // Local variables must be renamed.
         assert!(
             !result.contains("WebServer server"),
             "local 'server' declaration must be renamed"
@@ -1180,40 +1137,18 @@ mod tests {
             !result.contains("HttpRequest httpRequest"),
             "local 'httpRequest' declaration must be renamed"
         );
-
-        // The problematic string literal must be preserved verbatim.
         assert!(
             result.contains("{\\\"message\\\":\\\"hello xavier, it's 14:33:18\\\"}"),
             "string literal contents must be preserved after obfuscation"
         );
-
-        // The result must differ from the input (i.e. obfuscation actually ran).
         assert_ne!(
             result, input,
             "output must differ from input — obfuscation must have run"
         );
     }
 
-    /// Regression test for TestClass10222.
-    ///
-    /// The raw `.java` file on disk contains over-escaped sequences from a
-    /// previous JSONL encoding pass:
-    ///   * `\\"` (double-backslash + quote) instead of `\"` (one backslash + quote)
-    ///   * `\'` (backslash + apostrophe) in `it\'s`
-    ///
-    /// Before this fix, `blank_literals` would hit `\\` inside the string,
-    /// treat it as one escape pair (skipping both backslashes), then treat
-    /// the following `"` as the closing quote — closing the string far too
-    /// early.  The rest of the method body was left as raw text outside any
-    /// string, tree-sitter produced ERROR nodes, and the obfuscator silently
-    /// returned the source unchanged (prompt == response in the JSONL).
-    ///
-    /// The fix: `obfuscate_str` now calls `sanitize_backslashes` before
-    /// `blank_literals`, normalising `\\"` → `\"` so every string is
-    /// consumed as one correct literal.
     #[test]
     fn test_testclass10222_identifiers_renamed_despite_double_escaped_backslash_quote() {
-        // Exact content of the raw .java file on disk — with `\\"` and `\'`.
         let raw = concat!(
             "public class TestClass10222 {\n",
             "@Test public void should_load_spec() throws Exception {",
@@ -1227,17 +1162,12 @@ mod tests {
             " assertThat(((GivenUUIDGenerator) spec.getGiven().get(1)).getPlaybackUUIDs()).containsExactly(\"123456\");",
             " assertThat(spec.getWhens()).extracting(\"method\", \"path\").containsExactly(Tuple.tuple(\"GET\", \"message/xavier\"));",
             " assertThat(spec.getWhens()).extracting(\"then\").extracting(\"expectedCode\", \"expected\")",
-            // \\" = double-backslash+quote (dataset corruption), \' = escaped apostrophe
             " .containsExactly(Tuple.tuple(200, \"{\\\\\"message\\\\\":\\\\\"hello xavier, it\\'s 14:33:18\\\\\"}\"));",
             " }\n}",
         );
 
-        // main.rs calls sanitize_structural first — replicate that here.
         let sanitized = crate::sanitizer::sanitize_structural(raw);
 
-        // After sanitize_structural: \' → ' but \\" is still present.
-        // The smart consume_string_literal in blank_literals handles the \\" form
-        // via its corruption-recovery heuristic — no further normalisation needed.
         assert!(
             sanitized.contains("it's"),
             "sanitize_structural must convert \\' to '"
@@ -1249,25 +1179,18 @@ mod tests {
 
         let result = super::obfuscate_str(&sanitized).expect("obfuscate_str must not fail");
 
-        // Method name must be renamed.
         assert!(
             !result.contains("should_load_spec"),
             "method 'should_load_spec' must be renamed to func_N"
         );
-
-        // The only local variable declaration is `spec`.
         assert!(
             !result.contains("RestxSpec spec"),
             "local 'spec' declaration must be renamed"
         );
-
-        // Usage sites must also be renamed.
         assert!(
             !result.contains("spec.getTitle()"),
             "usage 'spec.getTitle()' must use the renamed identifier"
         );
-
-        // String literals must be preserved.
         assert!(
             result.contains("cases/test/test.spec.yaml"),
             "plain string literal must be preserved"
@@ -1276,8 +1199,6 @@ mod tests {
             result.contains("should say hello"),
             "plain string literal must be preserved"
         );
-
-        // Sanity: output must differ from sanitized input.
         assert_ne!(
             result, sanitized,
             "output must differ from sanitized input — obfuscation must have run"
@@ -1374,7 +1295,7 @@ mod tests {
             ),
         );
     }
-    /// TestClass11957 pattern: JSON array with `\\"` before comma and bracket.
+
     #[test]
     fn obfuscate_str_preserves_literal_count_json_array() {
         assert_literal_count_preserved(
@@ -1389,8 +1310,6 @@ mod tests {
         );
     }
 
-    /// TestClass12696 pattern: valid `"\\\\"` (string value = `\\`).
-    /// `sanitize_backslashes` would corrupt this to `"\\"` (unterminated).
     #[test]
     fn obfuscate_str_preserves_literal_count_valid_double_backslash() {
         assert_literal_count_preserved(
@@ -1407,8 +1326,6 @@ mod tests {
 
     #[test]
     fn test_testclass10150_identifiers_renamed_despite_apostrophe_after_corrupt_quote() {
-        // This is what full_sanitize (sanitize_structural) produces from the raw file.
-        // The raw file had \\' (escaped apostrophe) which becomes plain ' here.
         let input = concat!(
             "public class TestClass10150 {\n",
             "@Test public void rot13() {",
@@ -1420,13 +1337,10 @@ mod tests {
 
         let result = super::obfuscate_str(input).expect("obfuscate_str must not fail");
 
-        // Method name must be renamed.
         assert!(
             !result.contains("rot13()"),
             "method 'rot13' must be renamed to func_N"
         );
-
-        // Local variables must be renamed.
         assert!(
             !result.contains("Provisioner p"),
             "local 'p' must be renamed"
@@ -1435,11 +1349,7 @@ mod tests {
             !result.contains("String result"),
             "local 'result' must be renamed"
         );
-
-        // Literal count must be preserved (guards against re-introducing the split).
         assert_literal_count_preserved("10150-style", input);
-
-        // Sanity: output must differ from input.
         assert_ne!(result, input, "obfuscation must have changed the source");
     }
 }

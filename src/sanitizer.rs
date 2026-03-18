@@ -21,22 +21,46 @@ pub fn sanitize(src: &str) -> String {
 /// Step 3 (backslash normalisation before `"`) is intentionally left out so
 /// that [`fix_string_literals`] can compare literal contents before those
 /// backslash runs are mutated.
-pub fn sanitize_structural(src: &str) -> String {
-    let mut out = src.to_string();
 
-    // ── 1. JSON unicode escapes that leaked into the source ─────────────────
-    out = fix_json_unicode_escapes(&out);
+pub fn sanitize_structural(src: &str) -> String {
+    // ── Single pass: strip null bytes and collapse CRLF → LF ────────────────
+    // This avoids two separate `.replace()` calls (each of which clones the
+    // whole string). We write into a pre-allocated buffer and only allocate a
+    // new String when the source actually contains one of these sequences.
+    let needs_fixup = src.contains('\0') || src.contains("\r\n");
+    let after_cr_null = if needs_fixup {
+        let mut out = String::with_capacity(src.len());
+        let mut bytes = src.as_bytes();
+        while !bytes.is_empty() {
+            match bytes[0] {
+                b'\0' => {
+                    bytes = &bytes[1..];
+                }
+                b'\r' if bytes.len() > 1 && bytes[1] == b'\n' => {
+                    out.push('\n');
+                    bytes = &bytes[2..];
+                }
+                _ => {
+                    // Copy a full UTF-8 char at once.
+                    let ch = src[src.len() - bytes.len()..]
+                        .chars()
+                        .next()
+                        .unwrap_or('\0');
+                    out.push(ch);
+                    bytes = &bytes[ch.len_utf8()..];
+                }
+            }
+        }
+        out
+    } else {
+        src.to_string()
+    };
+
+    // ── 1. JSON unicode escapes that leaked into the source ──────────────────
+    let after_unicode = fix_json_unicode_escapes(&after_cr_null);
 
     // ── 2. Escaped single-quotes  \'  →  '  ─────────────────────────────────
-    out = fix_escaped_single_quotes(&out);
-
-    // ── 4. CRLF  →  LF ──────────────────────────────────────────────────────
-    out = out.replace("\r\n", "\n");
-
-    // ── 5. Null bytes ────────────────────────────────────────────────────────
-    out = out.replace('\0', "");
-
-    out
+    fix_escaped_single_quotes(&after_unicode)
 }
 
 /// Phase 2 — over-escaped backslashes before double-quotes.
@@ -52,13 +76,16 @@ pub fn sanitize_structural(src: &str) -> String {
 /// We therefore repeat the replacement until the output stabilises so
 /// that every `\"` in the result has exactly one preceding backslash,
 /// regardless of how many encoding passes the source went through.
+
 pub fn sanitize_backslashes(src: &str) -> String {
     let mut out = src.to_string();
     loop {
         let next = out
             .replace("\\\\\\\"", "\\\"") // 3 backslashes+quote → 1 backslash+quote
             .replace("\\\\\"", "\\\""); // 2 backslashes+quote → 1 backslash+quote
-        if next == out {
+        // Length check first — any replacement makes the string shorter,
+        // so a length match means nothing changed (much cheaper than `==`).
+        if next.len() == out.len() {
             break;
         }
         out = next;
@@ -463,33 +490,21 @@ mod tests {
 
     #[test]
     fn test_fix_string_literals_only_identifiers_differ_after_fix() {
-        // Regression test for TestClass13026 — the exact pair from the dataset
-        // that triggered the token-count mismatch bug.
-        //
-        // The original Java source uses  "\\\\"  (4 backslashes = 2 literal \\ at
-        // runtime) for the delimiter and  "\\\\one\\\\two"  for the match path.
-        // In the dataset the response was stored with the string literals
-        // double-encoded, producing far more backslashes than the prompt.
-        //
-        // After fix_string_literals the only remaining differences between
-        // prompt and response must be the renamed identifiers.
         let prompt = concat!(
             "public class TestClass13026 {\n",
             "@Test public void func_1() { ",
             "TreeDispatcher<String> var_1 = setupDispatcher(); ",
-            "var_1.setDelimiter(\"\\\\\\\\\"); ", // "\\\\" in Java source
+            "var_1.setDelimiter(\"\\\\\\\\\"); ",
             "assertEquals(dispatcher.findExactMatch(\"\\\\\\\\one\\\\\\\\two\"), \"/one/two\"); ",
             "assertNull(var_1.findExactMatch(\"/one/two\")); }\n",
             "}",
         );
 
-        // The response has the same string literals but with extra escaping layers
-        // (corruption from the online dataset), plus the original identifier names.
         let response_corrupt = concat!(
             "public class TestClass13026 {\n",
             "@Test public void testSetDelimiter() { ",
             "TreeDispatcher<String> dispatcher = setupDispatcher(); ",
-            "dispatcher.setDelimiter(\"\\\\\\\\\\\\\\\\\\\\\"); ", // 10 backslashes — corrupt
+            "dispatcher.setDelimiter(\"\\\\\\\\\\\\\\\\\\\\\"); ",
             "assertEquals(dispatcher.findExactMatch(\"\\\\\\\\\\\\\\\\one\\\\\\\\\\\\\\\\two\"), \"/one/two\"); ",
             "assertNull(dispatcher.findExactMatch(\"/one/two\")); }\n",
             "}",
@@ -498,7 +513,6 @@ mod tests {
         let fixed = fix_string_literals(prompt, response_corrupt)
             .expect("literal counts match — fix must succeed");
 
-        // Token counts must now be equal.
         let token_re = regex::Regex::new(r"[A-Za-z_]\w*|[^\w\s]|\d+|\s+").unwrap();
         let p_count = token_re.find_iter(prompt).count();
         let r_count = token_re.find_iter(&fixed).count();
@@ -507,7 +521,6 @@ mod tests {
             "token counts must match after fix (prompt={p_count}, response={r_count})"
         );
 
-        // The only remaining differences must be identifier renames.
         let obf_re = regex::Regex::new(r"^(func_\d+|var_\d+)$").unwrap();
         let p_toks: Vec<_> = token_re.find_iter(prompt).map(|m| m.as_str()).collect();
         let r_toks: Vec<_> = token_re.find_iter(&fixed).map(|m| m.as_str()).collect();
@@ -521,7 +534,6 @@ mod tests {
             );
         }
 
-        // String literals in the fixed response must equal those in the prompt.
         assert!(
             fixed.contains("\\\\\\\\"),
             "fixed response must contain the correct 4-backslash delimiter literal"
@@ -534,21 +546,9 @@ mod tests {
 
     // ── sanitize_backslashes multi-pass regression ───────────────────────────
 
-    /// Regression: TestClass11755.
-    ///
-    /// The raw dataset file had been through more than one JSONL encoding pass,
-    /// leaving 4-backslash runs before quotes (`\\\\"`).  A single replacement
-    /// pass reduces `\\\\"` → `\\"` (still over-escaped), causing
-    /// `consume_string_literal` to close the string too early and spill the
-    /// method body outside any string — tree-sitter then produces ERROR nodes
-    /// and the obfuscator returns the source unchanged.
-    ///
-    /// `sanitize_backslashes` must loop until stable so that 4+ backslash runs
-    /// are fully reduced to a single `\"`.
     #[test]
     fn sanitize_backslashes_fully_reduces_four_backslash_run() {
-        // 4 backslashes + quote — needs two passes to reach \"
-        let input = "\\\\\\\\\""; // Rust: 4 backslashes + quote
+        let input = "\\\\\\\\\""; // 4 backslashes + quote
         let result = super::sanitize_backslashes(input);
         assert_eq!(
             result, "\\\"",
@@ -558,7 +558,6 @@ mod tests {
 
     #[test]
     fn sanitize_backslashes_fully_reduces_six_backslash_run() {
-        // 6 backslashes + quote — needs three passes
         let input = "\\\\\\\\\\\\\""; // 6 backslashes + quote
         let result = super::sanitize_backslashes(input);
         assert_eq!(
@@ -567,10 +566,6 @@ mod tests {
         );
     }
 
-    /// Regression: TestClass11755 full source — after `sanitize_backslashes`
-    /// the source must contain exactly 3 string literals (not 5 broken ones),
-    /// all method-body identifiers must be outside strings, and the result
-    /// must be stable (calling again makes no further changes).
     #[test]
     fn sanitize_backslashes_testclass11755_produces_correct_literal_count() {
         let raw = concat!(
@@ -578,24 +573,20 @@ mod tests {
             "@Test public void testString() throws IOException {",
             " final ByteArrayOutputStream baos = new ByteArrayOutputStream();",
             " final AJsonSerHelper ser = new AJsonSerHelper(baos);",
-            // first arg: 4-backslash run before the closing quote of \"{}[]\"
             " ser.writeStringLiteral(\"abcäöü\\\\r\\\\n\\\\t \\\\\\\\\\\"{}[]\");",
             " final String result = new String(baos.toByteArray(), \"utf-8\");",
-            // second string arg: even deeper backslash run
             " assertEquals(\"\\\"abcäöü\\\\\\\\u000d\\\\\\\\u000a\\\\\\\\u0009 \\\\\\\\\\\\\\\\\\\\\\\\\\\"{}[]\\\"\", result);",
             " }\n}",
         );
 
         let result = super::sanitize_backslashes(raw);
 
-        // Must be idempotent — calling again must not change anything.
         assert_eq!(
             super::sanitize_backslashes(&result),
             result,
             "sanitize_backslashes must be idempotent"
         );
 
-        // Count string literals using the same logic as consume_string_literal.
         let bytes = result.as_bytes();
         let mut count = 0;
         let mut i = 0;
@@ -623,7 +614,6 @@ mod tests {
             count
         );
 
-        // Identifiers must be outside strings (not swallowed by a runaway literal).
         assert!(result.contains("baos"), "identifier 'baos' must be visible");
         assert!(result.contains("ser"), "identifier 'ser' must be visible");
         assert!(
@@ -634,24 +624,16 @@ mod tests {
 
     // ── extract_string_literal_spans sync tests ──────────────────────────────
 
-    /// `extract_string_literal_spans` (used by `fix_string_literals`) must count
-    /// string literals identically to `blank_literals` / `consume_string_literal`.
-    /// If they diverge, `fix_string_literals` rejects the pair with "String literal
-    /// count mismatch" even when `blank_literals` parsed it fine.
-    ///
-    /// This helper mirrors the smart scanner logic.
     fn smart_span_count(src: &str) -> usize {
         super::extract_string_literal_spans(src).len()
     }
 
     #[test]
     fn extract_spans_matches_blank_literals_for_corrupt_backslash_quote() {
-        // TestClass10186 / TestClass10859 style: \\" sequences in the source.
         let src = concat!(
             "assertThat(httpRequest.body().trim())",
             ".isEqualTo(\"{\\\\\"message\\\\\":\\\\\"hello xavier, it's 14:33:18\\\\\"}\");",
         );
-        // The smart scanner must treat \\" before a letter/: as embedded → 1 literal.
         assert_eq!(
             smart_span_count(src),
             1,
@@ -661,7 +643,6 @@ mod tests {
 
     #[test]
     fn extract_spans_matches_blank_literals_for_valid_double_backslash() {
-        // TestClass12696 style: valid \\\\ string (value = \\).
         let src = "assertThat(result).isEqualTo(\"\\\\\\\\\");";
         assert_eq!(
             smart_span_count(src),
@@ -672,19 +653,12 @@ mod tests {
 
     #[test]
     fn extract_spans_count_equals_blank_literals_count_testclass10859() {
-        // Contains \\"activeProfiles\\":[\\"  — must give the same count as blank_literals.
         let src = concat!(
             "assertTrue(res.getResponse().getContentAsString()",
             ".contains(\"\\\\\"activeProfiles\\\":[\\\\\"\"",
             "+profiles[0]+\"+\\\\\"]\"));",
         );
-        // Both naive and smart are used here; just assert they agree.
         let spans = super::extract_string_literal_spans(src);
-        // The count should be consistent (smart: 3 fragments that together form the arg).
-        // Most importantly it must NOT be 5 (naive) vs 4 (smart) mismatch.
-        // Verify by checking the count is the same as blank_literals would produce.
-        // We can't call blank_literals from here, but we can assert the span scanner
-        // uses the same heuristic by checking a known expected value.
         assert_eq!(
             spans.len(),
             3,

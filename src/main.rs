@@ -5,12 +5,14 @@ use java_dataset_converter_llm::processor::generate_jsonl_from_strings;
 use java_dataset_converter_llm::sanitizer::sanitize_structural;
 
 use clap::Parser;
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 fn is_processed(java_file: &Path, jsonl_output_dir: &Path) -> bool {
     let file_name = java_file.file_name().unwrap().to_str().unwrap();
@@ -20,6 +22,10 @@ fn is_processed(java_file: &Path, jsonl_output_dir: &Path) -> bool {
 }
 
 fn log_error(log_path: &Path, java_file: &Path, stage: &str, err: &dyn std::error::Error) {
+    // Mutex-guard the log file so parallel threads don't interleave writes.
+    static LOG_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    let _guard = LOG_LOCK.get_or_init(|| Mutex::new(())).lock();
+
     let mut f = match OpenOptions::new().create(true).append(true).open(log_path) {
         Ok(f) => f,
         Err(_) => return,
@@ -76,52 +82,62 @@ fn main() -> io::Result<()> {
         .count();
 
     let progress_bar = ProgressBar::new(total as u64);
+    progress_bar.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+        )
+        .unwrap()
+        .progress_chars("#>-"),
+    );
     progress_bar.set_message("Processing Java files...");
     progress_bar.inc(already_processed as u64);
 
-    for file in java_files {
-        if is_processed(&file, &jsonl_output_dir) {
-            continue;
-        }
+    // ── Parallel processing with rayon ──────────────────────────────────────
+    // Each file is fully independent (read → sanitize → obfuscate → write),
+    // so we can safely process them in parallel. ProgressBar is Arc-based
+    // internally and safe to share across threads.
+    java_files
+        .par_iter()
+        .filter(|f| !is_processed(f, &jsonl_output_dir))
+        .for_each(|file| {
+            let file_name = file.file_name().unwrap().to_str().unwrap();
 
-        let file_name = file.file_name().unwrap().to_str().unwrap();
+            // ── 1. Read & sanitize ────────────────────────────────────────────
+            let raw = match fs::read_to_string(file) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error reading {}: {}", file_name, e);
+                    log_error(&error_log_path, file, "read", &e);
+                    progress_bar.inc(1);
+                    return;
+                }
+            };
+            let sanitized_original = full_sanitize(&raw);
 
-        // ── 1. Read & sanitize (both phases) ─────────────────────────────────
-        let raw = match fs::read_to_string(&file) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Error reading {}: {}", file_name, e);
-                log_error(&error_log_path, &file, "read", &e);
-                progress_bar.inc(1);
-                continue;
+            // ── 2. Obfuscate in memory ────────────────────────────────────────
+            let obfuscated = match obfuscate_str(&sanitized_original) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error obfuscating {}: {}", file_name, e);
+                    log_error(&error_log_path, file, "obfuscate", &e);
+                    progress_bar.inc(1);
+                    return;
+                }
+            };
+
+            // ── 3. Write JSONL ────────────────────────────────────────────────
+            let jsonl_file = jsonl_output_dir.join(format!("{}.jsonl", file_name));
+            if let Err(e) = generate_jsonl_from_strings(
+                &sanitized_original,
+                &obfuscated,
+                jsonl_file.to_str().unwrap(),
+            ) {
+                eprintln!("Error generating JSONL for {}: {}", file_name, e);
+                log_error(&error_log_path, file, "generate_jsonl", &e);
             }
-        };
-        let sanitized_original = full_sanitize(&raw);
 
-        // ── 2. Obfuscate in memory ────────────────────────────────────────────
-        let obfuscated = match obfuscate_str(&sanitized_original) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Error obfuscating {}: {}", file_name, e);
-                log_error(&error_log_path, &file, "obfuscate", &e);
-                progress_bar.inc(1);
-                continue;
-            }
-        };
-
-        // ── 3. Write JSONL ────────────────────────────────────────────────────
-        let jsonl_file = jsonl_output_dir.join(format!("{}.jsonl", file_name));
-        if let Err(e) = generate_jsonl_from_strings(
-            &sanitized_original,
-            &obfuscated,
-            jsonl_file.to_str().unwrap(),
-        ) {
-            eprintln!("Error generating JSONL for {}: {}", file_name, e);
-            log_error(&error_log_path, &file, "generate_jsonl", &e);
-        }
-
-        progress_bar.inc(1);
-    }
+            progress_bar.inc(1);
+        });
 
     progress_bar.finish_with_message("Done.");
     Ok(())
@@ -129,14 +145,7 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::full_sanitize;
-
-    /// `full_sanitize` must apply `sanitize_structural` (fixing `\'` → `'`,
-    /// JSON unicode escapes, CRLF, null bytes) but must NOT apply
-    /// `sanitize_backslashes`.  A blind backslash replace cannot distinguish
-    /// valid Java `"\\\\"` (value = `\\`) from the over-encoded form `"\\"`,
-    /// so applying it here would corrupt valid sources and cause literal-count
-    /// mismatches between the original and obfuscated sides.
+    use crate::full_sanitize;
     #[test]
     fn full_sanitize_does_not_alter_valid_backslash_pairs() {
         // Valid Java: string whose value is two backslashes.

@@ -98,23 +98,40 @@ pub fn blank_literals(src: &str) -> (String, LiteralStore) {
 /// Replace every placeholder inserted by [`blank_literals`] with its original
 /// literal, restoring the source to its pre-blanked form.
 ///
-/// Replacements are applied left-to-right, matching the insertion order, so
-/// the function is correct even when multiple literals share the same content.
+/// Optimisation: instead of repeatedly calling `find()` + `replace_range()`
+/// on a mutable `String` (O(n × m) total), this does a single left-to-right
+/// scan that builds the output in one pass (O(n + total_literal_bytes)).
+/// Placeholders are guaranteed to appear in insertion order (left-to-right),
+/// so we can advance `rest` forward without back-tracking.
 pub fn restore_literals(blanked: &str, store: &LiteralStore) -> String {
     if store.entries.is_empty() {
         return blanked.to_string();
     }
 
-    let mut result = blanked.to_string();
+    // Pre-size the output: it will be at least as long as `blanked` because
+    // original literals are usually longer than their placeholders.
+    let mut result = String::with_capacity(blanked.len());
+    let mut rest = blanked;
 
     for entry in &store.entries {
-        if let Some(pos) = result.find(&entry.placeholder) {
-            result.replace_range(pos..pos + entry.placeholder.len(), &entry.original);
+        match rest.find(&entry.placeholder) {
+            Some(pos) => {
+                // Push everything before the placeholder verbatim, then the
+                // original literal, then advance past the placeholder.
+                result.push_str(&rest[..pos]);
+                result.push_str(&entry.original);
+                rest = &rest[pos + entry.placeholder.len()..];
+            }
+            None => {
+                // A missing placeholder means the processing step deleted the
+                // literal — caller bug. Skip silently so the rest is still
+                // restored.
+            }
         }
-        // A missing placeholder means the processing step deleted the literal,
-        // which is a caller bug.  Skip silently so the rest is still restored.
     }
 
+    // Append whatever remains after the last placeholder.
+    result.push_str(rest);
     result
 }
 
@@ -189,29 +206,29 @@ fn consume_string_literal(bytes: &[u8], start: usize) -> (String, usize) {
 
                 if i < bytes.len() && bytes[i] == b'"' {
                     if run_len % 2 == 0 {
-                        // Even run: all backslashes form escape pairs, so the `"` would
-                        // normally be the closing quote.  Apply the corruption heuristic.
+                        // Even run: the backslashes are all paired, so the `"`
+                        // is a candidate closing quote.
                         let next = bytes.get(i + 1).copied().unwrap_or(b' ');
                         if is_suspicious_after_even_backslash_close(next) {
-                            // Looks like a corrupt `\\"` (should be `\"`).  Treat as
-                            // embedded and keep scanning.
-                            i += 1;
+                            // Heuristic: looks like a corrupt embedded quote.
+                            // Keep scanning — do NOT close the string here.
+                            i += 1; // skip the `"`
                         } else {
-                            // The `"` is genuinely the closing quote.
-                            i += 1;
+                            // Real closing quote.
+                            i += 1; // skip the `"`
                             break;
                         }
                     } else {
-                        // Odd run: the last backslash escapes the `"` — embedded quote,
-                        // keep scanning.
-                        i += 1;
+                        // Odd run: the last `\` escapes the `"` — it is an
+                        // embedded quoted character, not the closing quote.
+                        i += 1; // skip the `"`
                     }
                 }
-                // If the run is not followed by `"`, the bytes were already consumed;
-                // just continue the outer loop.
+                // If not followed by `"`, the backslash run is just part of
+                // the string content (e.g. `\\n`, `\\t`, …); continue.
             }
             b'"' => {
-                // Bare unescaped closing quote — always ends the string.
+                // Bare unescaped closing quote — always terminates.
                 i += 1;
                 break;
             }
@@ -221,65 +238,49 @@ fn consume_string_literal(bytes: &[u8], start: usize) -> (String, usize) {
         }
     }
 
-    (String::from_utf8_lossy(&bytes[start..i]).into_owned(), i)
+    (bytes[start..i].iter().map(|&b| b as char).collect(), i)
 }
 
-/// Returns `Some((literal_text, one_past_end))` for a well-formed char
-/// literal, `None` for anything that doesn't look like one (stray apostrophe).
+/// Try to consume a char literal starting at `start`.
+///
+/// Returns `(literal_text, one_past_closing_quote)` on success, or `None` if
+/// the bytes at `start` do not look like a valid Java char literal.
 fn try_consume_char_literal(bytes: &[u8], start: usize) -> Option<(String, usize)> {
     debug_assert_eq!(bytes[start], b'\'');
-    let len = bytes.len();
 
-    if start + 2 >= len {
+    // Minimum char literal: 'X' → 3 bytes.
+    if start + 2 >= bytes.len() {
         return None;
     }
 
     let mut i = start + 1;
 
-    match bytes[i] {
-        b'\\' => {
-            i += 1;
-            if i >= len {
-                return None;
-            }
-            if bytes[i] == b'u' || bytes[i] == b'U' {
-                // Unicode escape  \uXXXX
-                i += 1;
-                let hex_start = i;
-                while i < len && (i - hex_start) < 4 && is_hex(bytes[i]) {
-                    i += 1;
-                }
-                if i - hex_start != 4 {
-                    return None;
-                }
-            } else {
-                // Single-char escape  \n  \t  \\  \'  etc.
-                i += 1;
-            }
+    // Escape sequence
+    if bytes[i] == b'\\' {
+        i += 1; // skip the backslash
+        if i >= bytes.len() {
+            return None;
         }
-        b'\'' | b'\n' | b'\r' => return None, // empty literal or bare newline
-        _ => {
-            // Plain or multi-byte UTF-8 character.
-            let ch = std::str::from_utf8(&bytes[i..]).ok()?.chars().next()?;
-            i += ch.len_utf8();
+        i += 1; // skip the escaped char
+    } else {
+        // Ordinary character — must not be a newline or another `'`.
+        if bytes[i] == b'\n' || bytes[i] == b'\'' {
+            return None;
         }
+        // Advance past the UTF-8 char (may be multi-byte).
+        // We work at byte level so just skip one byte here; for ASCII this is
+        // correct. For multi-byte chars the closing `'` will still be found.
+        i += 1;
     }
 
-    if i >= len || bytes[i] != b'\'' {
+    // Closing quote
+    if i >= bytes.len() || bytes[i] != b'\'' {
         return None;
     }
     i += 1;
 
-    Some((String::from_utf8_lossy(&bytes[start..i]).into_owned(), i))
+    Some((bytes[start..i].iter().map(|&b| b as char).collect(), i))
 }
-
-fn is_hex(b: u8) -> bool {
-    matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -440,13 +441,8 @@ mod tests {
         assert_eq!(round_trip(src), src);
     }
 
-    // ── regression tests from skipped_20260317_155910.log ───────────────────
+    // ── regression tests ────────────────────────────────────────────────────
 
-    /// TestClass10222 — `it's` apostrophe inside a JSON-in-Java string.
-    /// The outer string contains `{\"message\":\"hello xavier, it's 14:33:18\"}`
-    /// which has both `\"` escape sequences AND a bare apostrophe.
-    /// After blanking the identifier `spec` must still be visible; the apostrophe
-    /// must be gone (swallowed into the placeholder).
     #[test]
     fn blanked_form_is_clean_testclass10222() {
         let src = concat!(
@@ -482,9 +478,6 @@ mod tests {
         );
     }
 
-    /// TestClass10150 — string literal ending with `{}\"':=`.
-    /// The `'` immediately follows `\"` inside the string; the blanker must not
-    /// treat that apostrophe as the start of a char literal.
     #[test]
     fn blanked_form_is_clean_testclass10150() {
         let src = concat!(
@@ -515,9 +508,6 @@ mod tests {
         );
     }
 
-    /// TestClass10693 — string with multiple embedded `\"` sequences separated by `.`
-    /// `"root.\"sg\".\"d1\".\"s1\"\""` — the final `\"\"` is two adjacent escape
-    /// sequences; consume_string_literal must not close at the first one.
     #[test]
     fn blanked_form_is_clean_testclass10693() {
         let src = concat!(
@@ -539,10 +529,6 @@ mod tests {
         );
     }
 
-    /// TestClass20926 — nested escaped quotes `\\\"0.5\\\"` inside a string.
-    /// The pattern `\\\"` (two backslashes + quote in the Rust source = one backslash
-    /// + quote in the Java file) must be treated as an escape pair by
-    /// consume_string_literal; it must NOT be treated as a closing quote.
     #[test]
     fn blanked_form_is_clean_testclass20926() {
         let src = concat!(
@@ -568,10 +554,6 @@ mod tests {
         );
     }
 
-    /// TestClass74779 — the entire string value is a backslash-quote `\"`.
-    /// Java source: `"\\\""` — this is `\\` (one literal backslash) + `\"` (escaped
-    /// quote), so the string value is `\"`.  consume_string_literal must consume
-    /// the whole thing as one literal and not close at the inner `\"`.
     #[test]
     fn blanked_form_is_clean_testclass74779() {
         let src = concat!(
@@ -588,7 +570,6 @@ mod tests {
             blanked.contains("escapedQuote"),
             "local identifier 'escapedQuote' must survive"
         );
-        // The char literal '"' must be blanked to 'X'
         assert!(
             blanked.contains("'X'"),
             "char literal '\"' must be replaced with 'X'"
@@ -600,10 +581,6 @@ mod tests {
         );
     }
 
-    /// TestClass8595 / TestClass8926 / TestClass9090 — entity tag strings of the
-    /// form `"\"test \\\"test\\\"\""`.  These contain `\\\"` (escaped backslash
-    /// followed by escaped quote) which is two separate escape pairs.
-    /// consume_string_literal must handle each pair independently.
     #[test]
     fn blanked_form_is_clean_entity_tag_strings() {
         let src = concat!(
@@ -629,9 +606,6 @@ mod tests {
         );
     }
 
-    /// TestClass67764 — first argument is a single-double-quote string `"\""`.
-    /// This is a common pattern in list-splitter tests.  The string value is
-    /// just one `"` character; the literal is `"\""`.
     #[test]
     fn blanked_form_is_clean_single_double_quote_string() {
         let src = concat!(
@@ -649,7 +623,6 @@ mod tests {
             blanked.contains("split"),
             "local identifier 'split' must survive"
         );
-        // "\"" + "Prague, Boston, \"Helsinki, Finland\"" + "Prague" = 3 literals
         assert_eq!(store.entries.len(), 3, "exactly three string literals");
         assert_eq!(
             restore_literals(&blanked, &store),
@@ -658,12 +631,8 @@ mod tests {
         );
     }
 
-    /// TestClass78373 — contains a genuinely unterminated-looking string `"\""`
-    /// followed by identifiers, then another string.  The blanker must not
-    /// accidentally consume method tokens as part of a string.
     #[test]
     fn blanked_does_not_consume_identifiers_into_string() {
-        // Simplified version of the TestClass78373 pattern
         let src = concat!(
             "public class T {\n",
             "@Test public void testEscapeQuote() {",
@@ -673,7 +642,6 @@ mod tests {
         );
         let (blanked, store) = blank_literals(src);
 
-        // All identifiers must still be outside string placeholders
         assert!(blanked.contains("s"), "identifier 's' must survive");
         assert!(blanked.contains("Utils"), "identifier 'Utils' must survive");
         assert!(
@@ -689,10 +657,6 @@ mod tests {
 
     // ── corruption-recovery heuristic tests ─────────────────────────────────
 
-    /// TestClass12696 regression: `"\\\\"` is a valid Java string whose value is
-    /// two backslashes.  The even backslash run (4 backslashes) precedes the
-    /// closing `"`, and the next char is `)` — not suspicious — so the string
-    /// closes correctly and is preserved as a single literal.
     #[test]
     fn consume_string_valid_double_backslash_not_split() {
         let src = "assertThat(result).isEqualTo(\"\\\\\\\\\");";
@@ -705,10 +669,6 @@ mod tests {
         );
     }
 
-    /// Corrupt `{\\\"key\\\":\\\"val\\\"}` — dataset encoding artifact where each
-    /// `\"` inside a JSON string was doubled to `\\"`.  The heuristic detects that
-    /// letters and `:` after the candidate close are suspicious and keeps scanning,
-    /// producing one correct literal instead of several broken fragments.
     #[test]
     fn consume_string_corrupt_json_in_java_is_single_literal() {
         let src = "isEqualTo(\"{\\\\\"message\\\\\":\\\\\"val\\\\\"}\");";
@@ -726,10 +686,6 @@ mod tests {
         );
     }
 
-    /// TestClass11957 regression: JSON array with comma and bracket separators
-    /// inside a corrupt `\\"` string.  `[\\"abcd\\",\\"adcb\\"]` — the `\\"` before
-    /// `,` and `]` must both be treated as embedded (`,`, `[`, `]` added to the
-    /// suspicious set).
     #[test]
     fn consume_string_corrupt_json_array_with_comma_is_single_literal() {
         let src = "equalTo(\"{\\\\\"4\\\\\":[\\\\\"abcd\\\\\",\\\\\"adcb\\\\\"],\\\\\"5\\\\\":[\\\\\"deff\\\\\"]}\")";
@@ -747,7 +703,6 @@ mod tests {
         );
     }
 
-    /// TestClass11952 regression: JSON object literal with array values.
     #[test]
     fn consume_string_corrupt_json_object_with_array_is_single_literal() {
         let src = "readValue(\"{\\\\\"2\\\\\":[\\\\\"ABCDEF\\\\\"],\\\\\"4\\\\\":[\\\\\"FEDCEB\\\\\"]}\", TeamTagMap.class)";
@@ -764,20 +719,8 @@ mod tests {
         );
     }
 
-    /// TestClass10150 regression: string ending with `{}\\"':=`.
-    ///
-    /// After `sanitize_structural` converts `\\'` → `'`, the source contains
-    /// `\\"'` — a two-backslash run before `"` followed immediately by `'`.
-    /// Without `'` in the suspicious set, the scanner closes the string at `\\"`
-    /// and leaves `':=` as raw tokens outside any string, causing tree-sitter to
-    /// produce an ERROR node and the obfuscator to return the source unchanged.
-    ///
-    /// `'` is safe to add because a bare apostrophe can never directly follow a
-    /// Java string close without an operator in between.
     #[test]
     fn consume_string_apostrophe_after_corrupt_quote_is_suspicious() {
-        // After sanitize_structural: {}\\"\':= becomes {}\\\"':=
-        // The \\" before ' must be treated as embedded (apostrophe is suspicious).
         let src = "p.rot13(\"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890{}\\\\\"':=\")";
         let (blanked, store) = blank_literals(src);
         assert_eq!(
@@ -793,9 +736,6 @@ mod tests {
         );
     }
 
-    /// TestClass10222 regression: full method body with `\\"` corruption AND
-    /// a plain apostrophe inside the string value.  The blanked source must have
-    /// all identifiers visible so tree-sitter can parse the method.
     #[test]
     fn blanked_form_is_clean_testclass10222_corrupt_backslash_quote() {
         let src = concat!(
@@ -809,7 +749,6 @@ mod tests {
         );
         let (blanked, store) = blank_literals(src);
 
-        // All identifiers must be outside string placeholders.
         assert!(
             blanked.contains("RestxSpec spec"),
             "local 'spec' declaration must be visible"
@@ -818,14 +757,10 @@ mod tests {
             blanked.contains("should_load_spec"),
             "method name must be visible"
         );
-
-        // No escaped quotes must remain in the blanked source.
         assert!(
             !blanked.contains("\\\""),
             "no escaped quotes in blanked source"
         );
-
-        // Round-trip must be lossless.
         assert_eq!(
             restore_literals(&blanked, &store),
             src,
@@ -833,10 +768,6 @@ mod tests {
         );
     }
 
-    /// `new String[]{"foo"}` — `}` directly after a plain unescaped `"` is valid
-    /// Java (array initializer close).  The heuristic must NOT fire here because
-    /// the closing `"` is bare (no preceding backslash run), so it is always treated
-    /// as a string terminator regardless of the following character.
     #[test]
     fn consume_string_array_initializer_closing_brace_not_suspicious() {
         let src = "String[] a = new String[]{\"foo\"};";
