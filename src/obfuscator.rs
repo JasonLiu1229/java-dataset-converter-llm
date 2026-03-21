@@ -694,17 +694,33 @@ pub fn blank_source(src: &str) -> String {
 }
 
 pub fn obfuscate_str(sanitized_src: &str) -> io::Result<String> {
+    Ok(obfuscate_str_checked(sanitized_src)?.0)
+}
+
+/// Like [`obfuscate_str`] but also reports whether the literal-blanker fallback
+/// (i.e. `sanitize_backslashes` + re-blank) was required to produce a clean
+/// parse tree.
+///
+/// Returns `(obfuscated_source, needed_fallback)`.
+///
+/// * `needed_fallback = false` — the source parsed cleanly on the first attempt;
+///   the resulting JSONL pair is considered high quality.
+/// * `needed_fallback = true` — the source contained corrupt `\\"` sequences that
+///   required backslash collapsing before tree-sitter could parse it.  The
+///   resulting pair is still valid, but callers can optionally route it to a
+///   separate `jsonl_blanked/` sub-directory for tracking / analysis.
+pub fn obfuscate_str_checked(sanitized_src: &str) -> io::Result<(String, bool)> {
     let blanked = blank_literals_permanently(sanitized_src);
 
-    let blanked = if has_parse_errors(&blanked) {
+    let (blanked, needed_fallback) = if has_parse_errors(&blanked) {
         let recovered = sanitize_backslashes(sanitized_src);
-        blank_literals_permanently(&recovered)
+        (blank_literals_permanently(&recovered), true)
     } else {
-        blanked
+        (blanked, false)
     };
 
     let func_name_obfuscated = obfuscate_function_names(&blanked);
-    Ok(obfuscate_code(&func_name_obfuscated))
+    Ok((obfuscate_code(&func_name_obfuscated), needed_fallback))
 }
 
 /// File-based wrapper kept for CLI tooling that wants obfuscated `.java` files

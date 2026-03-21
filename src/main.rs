@@ -1,6 +1,6 @@
 use java_dataset_converter_llm::cli::Args;
 use java_dataset_converter_llm::helper::get_files;
-use java_dataset_converter_llm::obfuscator::obfuscate_str;
+use java_dataset_converter_llm::obfuscator::obfuscate_str_checked;
 use java_dataset_converter_llm::processor::generate_jsonl_from_strings;
 use java_dataset_converter_llm::sanitizer::sanitize_structural;
 
@@ -16,9 +16,21 @@ use std::sync::Mutex;
 
 fn is_processed(java_file: &Path, jsonl_output_dir: &Path) -> bool {
     let file_name = java_file.file_name().unwrap().to_str().unwrap();
-    jsonl_output_dir
+    let clean = jsonl_output_dir
         .join(format!("{}.jsonl", file_name))
-        .exists()
+        .exists();
+    let blanked_dir = blanked_subdir_of(jsonl_output_dir);
+    let in_blanked = blanked_dir.join(format!("{}.jsonl", file_name)).exists();
+    clean || in_blanked
+}
+
+fn blanked_subdir_of(jsonl_output_dir: &Path) -> PathBuf {
+    let parent = jsonl_output_dir.parent().unwrap_or(Path::new("."));
+    let dir_name = jsonl_output_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("jsonl");
+    parent.join(format!("{}_blanked", dir_name))
 }
 
 fn log_error(log_path: &Path, java_file: &Path, stage: &str, err: &dyn std::error::Error) {
@@ -39,17 +51,6 @@ fn log_error(log_path: &Path, java_file: &Path, stage: &str, err: &dyn std::erro
     );
 }
 
-/// Normalise a raw `.java` source string.
-///
-/// Only structural fixes are applied here (JSON unicode escapes, `\'` → `'`,
-/// CRLF → LF, null bytes).  Backslash normalisation is intentionally NOT done
-/// here: `sanitize_backslashes` is a blind text replace that cannot distinguish
-/// valid Java `"\\\\"` (a string whose value is `\\`) from the corrupted form
-/// `"\\"` produced by over-encoding.  Applying it here would destroy valid
-/// sources.  Both sides of the JSONL pair (`sanitized_original` and the output
-/// of `obfuscate_str`) go through `sanitize_structural` only, so their string
-/// literal structure is always identical and `fix_string_literals` never
-/// produces a count mismatch.
 fn full_sanitize(raw: &str) -> String {
     sanitize_structural(raw)
 }
@@ -72,6 +73,15 @@ fn main() -> io::Result<()> {
 
     fs::create_dir_all(&jsonl_output_dir)?;
 
+    // Create the blanked subdir eagerly only when the feature is enabled.
+    let jsonl_blanked_dir = if args.blanked_subdir {
+        let d = blanked_subdir_of(&jsonl_output_dir);
+        fs::create_dir_all(&d)?;
+        Some(d)
+    } else {
+        None
+    };
+
     let error_log_path = jsonl_output_dir.join("error.log");
     let java_files = get_files(input_dir.to_str().unwrap(), "java")?;
     let total = java_files.len();
@@ -92,17 +102,12 @@ fn main() -> io::Result<()> {
     progress_bar.set_message("Processing Java files...");
     progress_bar.inc(already_processed as u64);
 
-    // ── Parallel processing with rayon ──────────────────────────────────────
-    // Each file is fully independent (read → sanitize → obfuscate → write),
-    // so we can safely process them in parallel. ProgressBar is Arc-based
-    // internally and safe to share across threads.
     java_files
         .par_iter()
         .filter(|f| !is_processed(f, &jsonl_output_dir))
         .for_each(|file| {
             let file_name = file.file_name().unwrap().to_str().unwrap();
 
-            // ── 1. Read & sanitize ────────────────────────────────────────────
             let raw = match fs::read_to_string(file) {
                 Ok(s) => s,
                 Err(e) => {
@@ -114,9 +119,8 @@ fn main() -> io::Result<()> {
             };
             let sanitized_original = full_sanitize(&raw);
 
-            // ── 2. Obfuscate in memory ────────────────────────────────────────
-            let obfuscated = match obfuscate_str(&sanitized_original) {
-                Ok(s) => s,
+            let (obfuscated, needed_fallback) = match obfuscate_str_checked(&sanitized_original) {
+                Ok(pair) => pair,
                 Err(e) => {
                     eprintln!("Error obfuscating {}: {}", file_name, e);
                     log_error(&error_log_path, file, "obfuscate", &e);
@@ -124,9 +128,13 @@ fn main() -> io::Result<()> {
                     return;
                 }
             };
+            let target_dir = if needed_fallback {
+                jsonl_blanked_dir.as_deref().unwrap_or(&jsonl_output_dir)
+            } else {
+                &jsonl_output_dir
+            };
 
-            // ── 3. Write JSONL ────────────────────────────────────────────────
-            let jsonl_file = jsonl_output_dir.join(format!("{}.jsonl", file_name));
+            let jsonl_file = target_dir.join(format!("{}.jsonl", file_name));
             if let Err(e) = generate_jsonl_from_strings(
                 &sanitized_original,
                 &obfuscated,
@@ -146,10 +154,9 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::full_sanitize;
+
     #[test]
     fn full_sanitize_does_not_alter_valid_backslash_pairs() {
-        // Valid Java: string whose value is two backslashes.
-        // full_sanitize must leave this byte-for-byte identical.
         let raw = r#"assertThat(result).isEqualTo("\\\\");"#;
         let result = full_sanitize(raw);
         assert_eq!(
@@ -158,7 +165,6 @@ mod tests {
         );
     }
 
-    /// `full_sanitize` must still fix `\\'` → `'` (escaped apostrophe artifact).
     #[test]
     fn full_sanitize_fixes_escaped_apostrophe() {
         let raw = "Arrays.fill(buf, (byte) \\'Q\\');";
@@ -170,6 +176,106 @@ mod tests {
         assert!(
             !result.contains("\\'"),
             "full_sanitize must remove all \\' sequences"
+        );
+    }
+
+    // ── blanked_subdir_of helper ─────────────────────────────────────────────
+
+    use crate::blanked_subdir_of;
+    use std::path::Path;
+
+    #[test]
+    fn blanked_subdir_of_appends_blanked_suffix() {
+        let dir = Path::new("train/jsonl");
+        let blanked = blanked_subdir_of(dir);
+        assert_eq!(
+            blanked,
+            std::path::PathBuf::from("train/jsonl_blanked"),
+            "sibling directory must be '<parent>/<name>_blanked'"
+        );
+    }
+
+    #[test]
+    fn blanked_subdir_of_nested_path() {
+        let dir = Path::new("data/splits/test/jsonl");
+        let blanked = blanked_subdir_of(dir);
+        assert_eq!(
+            blanked,
+            std::path::PathBuf::from("data/splits/test/jsonl_blanked")
+        );
+    }
+
+    #[test]
+    fn blanked_subdir_of_top_level_name() {
+        // When the input path has no parent component (e.g. "jsonl"), the
+        // platform may return "" or "." for the parent, yielding either
+        // "jsonl_blanked" or "./jsonl_blanked".  Both are equivalent paths;
+        // assert on the file_name component only.
+        let dir = Path::new("jsonl");
+        let blanked = blanked_subdir_of(dir);
+        assert_eq!(
+            blanked.file_name().and_then(|n| n.to_str()),
+            Some("jsonl_blanked"),
+            "basename of the blanked sibling must be 'jsonl_blanked'"
+        );
+    }
+
+    #[test]
+    fn obfuscate_str_checked_clean_source_no_fallback() {
+        use java_dataset_converter_llm::obfuscator::obfuscate_str_checked;
+
+        let clean = concat!(
+            "public class T {\n",
+            "@Test public void testFoo() {",
+            " String s = \"hello\"; assertEquals(\"hello\", s);",
+            " }\n}",
+        );
+        let (result, needed_fallback) =
+            obfuscate_str_checked(clean).expect("obfuscate_str_checked must not fail");
+
+        assert!(
+            !needed_fallback,
+            "clean source must not trigger the literal-blanker fallback"
+        );
+        assert!(
+            !result.contains("testFoo"),
+            "method name must be renamed even without fallback"
+        );
+    }
+
+    #[test]
+    fn obfuscate_str_checked_corrupt_source_sets_fallback_flag() {
+        use java_dataset_converter_llm::obfuscator::obfuscate_str_checked;
+
+        // This is the TestClass10179 pattern: `\\n \\\"name\\\"` in the source
+        // file contains `\\n` (two backslashes + 'n') followed by a space then
+        // `\\"` (two backslashes + bare quote).  After blank_literals_permanently
+        // the scanner sees an even backslash run followed by `"`, then checks the
+        // next byte: a space is NOT in the suspicious set, so it closes the string
+        // early — leaving raw tokens outside a string that tree-sitter flags as
+        // ERROR nodes.  This is exactly the condition that must set needed_fallback=true.
+        //
+        // Contrast with `{\\\"key\\\"` where `{` IS suspicious: the heuristic
+        // keeps the string open and no parse error fires.
+        let corrupt = concat!(
+            "public class T {\n",
+            "@Test public void testCorrupt() throws Exception {",
+            " HttpRequest var_req = client().GET(\"/api/test\");",
+            // \\n = two backslashes + 'n' in value; space after = NOT suspicious → early close
+            " assertResponse(var_req, 200, \"{\\\\n \\\\\"name\\\\\" : \\\\\"val\\\\\"\\\\n}\");",
+            " }\n}",
+        );
+        let (result, needed_fallback) =
+            obfuscate_str_checked(corrupt).expect("obfuscate_str_checked must not fail");
+
+        assert!(
+            needed_fallback,
+            "TestClass10179-style source (\\\\n + space + \\\\\") must trigger \
+             the literal-blanker fallback (needed_fallback=true)"
+        );
+        assert!(
+            !result.contains("testCorrupt"),
+            "method name must still be renamed after fallback"
         );
     }
 }
