@@ -1,7 +1,7 @@
 use java_dataset_converter_llm::cli::Args;
 use java_dataset_converter_llm::helper::get_files;
 use java_dataset_converter_llm::obfuscator::obfuscate_str_checked;
-use java_dataset_converter_llm::processor::generate_jsonl_from_strings;
+use java_dataset_converter_llm::processor::{generate_jsonl_from_strings, generate_jsonl_raw};
 use java_dataset_converter_llm::sanitizer::sanitize_structural;
 
 use clap::Parser;
@@ -128,20 +128,36 @@ fn main() -> io::Result<()> {
                     return;
                 }
             };
-            let target_dir = if needed_fallback {
-                jsonl_blanked_dir.as_deref().unwrap_or(&jsonl_output_dir)
-            } else {
-                &jsonl_output_dir
-            };
 
-            let jsonl_file = target_dir.join(format!("{}.jsonl", file_name));
-            if let Err(e) = generate_jsonl_from_strings(
-                &sanitized_original,
-                &obfuscated,
-                jsonl_file.to_str().unwrap(),
-            ) {
-                eprintln!("Error generating JSONL for {}: {}", file_name, e);
-                log_error(&error_log_path, file, "generate_jsonl", &e);
+            // ── 3. Route & write JSONL ────────────────────────────────────────
+            if !needed_fallback {
+                // Clean source: write with real string content preserved.
+                let jsonl_file = jsonl_output_dir.join(format!("{}.jsonl", file_name));
+                if let Err(e) = generate_jsonl_raw(
+                    &sanitized_original,
+                    &obfuscated,
+                    jsonl_file.to_str().unwrap(),
+                ) {
+                    eprintln!("Error generating JSONL for {}: {}", file_name, e);
+                    log_error(&error_log_path, file, "generate_jsonl", &e);
+                }
+            } else if let Some(ref blanked_dir) = jsonl_blanked_dir {
+                // Corrupt source + --blanked-subdir: write blanked pair to sibling dir.
+                let jsonl_file = blanked_dir.join(format!("{}.jsonl", file_name));
+                if let Err(e) = generate_jsonl_from_strings(
+                    &sanitized_original,
+                    &obfuscated,
+                    jsonl_file.to_str().unwrap(),
+                ) {
+                    eprintln!("Error generating blanked JSONL for {}: {}", file_name, e);
+                    log_error(&error_log_path, file, "generate_jsonl_blanked", &e);
+                }
+            } else {
+                // Corrupt source + no flag: skip silently (file stays unprocessed).
+                eprintln!(
+                    "Skipping {} (corrupt source, --blanked-subdir not set)",
+                    file_name
+                );
             }
 
             progress_bar.inc(1);
@@ -240,6 +256,15 @@ mod tests {
         assert!(
             !result.contains("testFoo"),
             "method name must be renamed even without fallback"
+        );
+        // Real string content must be preserved — NOT replaced with "_".
+        assert!(
+            result.contains("\"hello\""),
+            "string literal content must be preserved on the clean path, got: {result}"
+        );
+        assert!(
+            !result.contains("\"_\""),
+            "clean path must not produce dummy '_' literals, got: {result}"
         );
     }
 

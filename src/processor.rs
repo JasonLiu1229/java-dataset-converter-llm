@@ -12,6 +12,40 @@ struct PromptResponse {
     response: String,
 }
 
+/// Write a JSONL training pair from in-memory source strings **without**
+/// blanking string literals.
+///
+/// Use this for clean sources where `obfuscate_str_checked` returned
+/// `needed_fallback = false` — the obfuscated string already has real literal
+/// content restored, so no further transformation is needed.
+pub fn generate_jsonl_raw(
+    original_src: &str,
+    obfuscated_src: &str,
+    output_file: &str,
+) -> std::io::Result<()> {
+    if !output_file.ends_with(".jsonl") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Output file must have a .jsonl extension",
+        ));
+    }
+
+    if obfuscated_src.trim().is_empty() {
+        return Err(std::io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Obfuscated source is empty",
+        ));
+    }
+
+    let mut writer = BufWriter::new(File::create(output_file)?);
+    let pair = PromptResponse {
+        prompt: obfuscated_src.to_string(),
+        response: original_src.to_string(),
+    };
+    writeln!(writer, "{}", serde_json::to_string(&pair)?)?;
+    Ok(())
+}
+
 /// Write a JSONL training pair from in-memory source strings.
 ///
 /// Both sides have string/char literals permanently replaced with `"_"` /
@@ -21,6 +55,9 @@ struct PromptResponse {
 /// both sides produce the same number of `"_"` literals even when the source
 /// contains corrupt `\\"` sequences or valid strings ending in even backslash
 /// runs like `"\\\\"`.
+///
+/// Use this only for the fallback (blanked) path — i.e. when
+/// `obfuscate_str_checked` returned `needed_fallback = true`.
 pub fn generate_jsonl_from_strings(
     original_src: &str,
     obfuscated_src: &str,

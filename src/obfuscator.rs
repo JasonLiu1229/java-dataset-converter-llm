@@ -7,7 +7,7 @@ use std::io;
 
 use tree_sitter::{Node, Parser};
 
-use crate::literal_blanker::blank_literals_permanently;
+use crate::literal_blanker::{blank_literals, blank_literals_permanently, restore_literals};
 use crate::sanitizer::{sanitize_backslashes, sanitize_structural};
 
 thread_local! {
@@ -710,17 +710,27 @@ pub fn obfuscate_str(sanitized_src: &str) -> io::Result<String> {
 ///   resulting pair is still valid, but callers can optionally route it to a
 ///   separate `jsonl_blanked/` sub-directory for tracking / analysis.
 pub fn obfuscate_str_checked(sanitized_src: &str) -> io::Result<(String, bool)> {
-    let blanked = blank_literals_permanently(sanitized_src);
+    // ── Clean path: reversible blanking ──────────────────────────────────────
+    // Use blank_literals (which stores originals) so we can restore the real
+    // string content after identifier renaming.  Only fall back to the permanent
+    // blanker when the source is so corrupt that tree-sitter cannot parse it.
+    let (blanked, store) = blank_literals(sanitized_src);
 
-    let (blanked, needed_fallback) = if has_parse_errors(&blanked) {
-        let recovered = sanitize_backslashes(sanitized_src);
-        (blank_literals_permanently(&recovered), true)
-    } else {
-        (blanked, false)
-    };
+    if !has_parse_errors(&blanked) {
+        // Source is clean: rename identifiers, then restore original string values.
+        let func_name_obfuscated = obfuscate_function_names(&blanked);
+        let renamed = obfuscate_code(&func_name_obfuscated);
+        let restored = restore_literals(&renamed, &store);
+        return Ok((restored, false));
+    }
 
-    let func_name_obfuscated = obfuscate_function_names(&blanked);
-    Ok((obfuscate_code(&func_name_obfuscated), needed_fallback))
+    // ── Fallback path: corrupt source (e.g. `\\"` sequences) ─────────────────
+    // Collapse backslashes so tree-sitter can parse, then permanently blank
+    // (we cannot restore originals reliably after backslash collapsing).
+    let recovered = sanitize_backslashes(sanitized_src);
+    let blanked_recovered = blank_literals_permanently(&recovered);
+    let func_name_obfuscated = obfuscate_function_names(&blanked_recovered);
+    Ok((obfuscate_code(&func_name_obfuscated), true))
 }
 
 /// File-based wrapper kept for CLI tooling that wants obfuscated `.java` files
@@ -1182,9 +1192,16 @@ mod tests {
             !result.contains("HttpRequest httpRequest"),
             "local 'httpRequest' declaration must be renamed"
         );
+        // Clean source: real string literals must be preserved, not replaced with "_".
+        // Note: the Java source wraps the value with \\\" (two backslashes + quote),
+        // so we assert on the unquoted content rather than the full quoted form.
         assert!(
-            result.contains("\"_\""),
-            "string literals must be replaced with dummy value"
+            result.contains("hello xavier, it's 14:33:18"),
+            "string literal content must be preserved on the clean path, got: {result}"
+        );
+        assert!(
+            !result.contains("\"_\""),
+            "clean path must not produce dummy '_' literals"
         );
         assert_ne!(
             result, input,
@@ -1236,9 +1253,17 @@ mod tests {
             !result.contains("spec.getTitle()"),
             "usage 'spec.getTitle()' must use the renamed identifier"
         );
+        // The corrupt-looking `{\\\"message\\\"...}` string has `{` after `\\"` which
+        // IS in the suspicious set, so the heuristic keeps it as one literal and
+        // tree-sitter parses it cleanly — this is the clean path.
+        // Real string content must be preserved, not replaced with "_".
         assert!(
-            result.contains("\"_\""),
-            "string literals must be replaced with dummy value"
+            result.contains("\"should say hello\""),
+            "string literal content must be preserved on the clean path"
+        );
+        assert!(
+            !result.contains("\"_\""),
+            "clean path must not produce dummy '_' literals"
         );
 
         assert_ne!(
@@ -1319,7 +1344,8 @@ mod tests {
         assert_eq!(
             before, after,
             "{}: obfuscate_str changed the string literal count from {} to {}.\n\
-             This will cause 'String literal count mismatch' in generate_jsonl_from_strings.\n\
+             On the clean path literals are restored, so counts must match the input.\n\
+             On the fallback path permanent blanking is used, but count must still match.\n\
              A likely cause is that sanitize_backslashes was re-added to obfuscate_str.",
             label, before, after
         );
@@ -1436,10 +1462,12 @@ mod tests {
             !result.contains("HttpRequest request"),
             "local 'request' must be renamed to var_N"
         );
-        // The string literal content must be preserved (only identifiers renamed).
+        // Fallback path: the `\\n ` (backslash-n + space) pattern causes the
+        // heuristic to close the string early because space is NOT suspicious.
+        // The fallback uses permanent blanking, so dummy "_" literals are expected.
         assert!(
             result.contains("\"_\""),
-            "string literals must be replaced with dummy value"
+            "fallback path must produce dummy '_' literals (corrupt source permanently blanked)"
         );
     }
 }
