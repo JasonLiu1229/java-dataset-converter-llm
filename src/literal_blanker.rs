@@ -290,7 +290,10 @@ fn consume_string_literal(bytes: &[u8], start: usize) -> (String, usize) {
         }
     }
 
-    (bytes[start..i].iter().map(|&b| b as char).collect(), i)
+    // CORRECTNESS: We must decode the byte slice as UTF-8, not byte-by-byte via
+    // `b as char` (Latin-1), which would corrupt any multi-byte character
+    // (e.g. `é` → `Ã©`) and cause token-count mismatches in the JSONL pairs.
+    (String::from_utf8_lossy(&bytes[start..i]).into_owned(), i)
 }
 
 /// Try to consume a char literal starting at `start`.
@@ -331,7 +334,8 @@ fn try_consume_char_literal(bytes: &[u8], start: usize) -> Option<(String, usize
     }
     i += 1;
 
-    Some((bytes[start..i].iter().map(|&b| b as char).collect(), i))
+    // CORRECTNESS: decode as UTF-8, not byte-by-byte Latin-1 (`b as char`).
+    Some((String::from_utf8_lossy(&bytes[start..i]).into_owned(), i))
 }
 
 #[cfg(test)]
@@ -833,6 +837,58 @@ mod tests {
             restore_literals(&blanked, &store),
             src,
             "round-trip must be lossless"
+        );
+    }
+
+    // ── UTF-8 round-trip tests ───────────────────────────────────────────────
+
+    /// Regression: TestClass11558 — `é` must survive blank_literals→restore_literals
+    /// without being mojibake'd into `Ã©`.
+    ///
+    /// Root cause: `consume_string_literal` previously used
+    /// `bytes[..].iter().map(|&b| b as char).collect()` which is a Latin-1
+    /// re-interpretation of the bytes. A 2-byte UTF-8 sequence like `é`
+    /// (0xC3 0xA9) was decoded as two separate chars `Ã` (U+00C3) and
+    /// `©` (U+00A9), causing a token-count mismatch between the prompt
+    /// (obfuscated, restored) and the response (original) sides of the JSONL pair.
+    #[test]
+    fn round_trip_preserves_utf8_accented_chars() {
+        let src = "assertThat(var_4, is(\"Bonjour John Doe, le test unitaire est passé\"));";
+        let result = round_trip(src);
+        assert_eq!(
+            result, src,
+            "round-trip must preserve UTF-8 multi-byte characters (é must not become Ã©)"
+        );
+        assert!(
+            result.contains('é'),
+            "é (U+00E9) must survive blank_literals → restore_literals"
+        );
+        assert!(
+            !result.contains("Ã©"),
+            "mojibake 'Ã©' must NOT appear after round-trip"
+        );
+    }
+
+    #[test]
+    fn round_trip_preserves_various_utf8_chars() {
+        // A broader set: French, German, Chinese, emoji — all multi-byte UTF-8.
+        let src = "assertEquals(\"München Ärger naïve 中文 🎉\", result);";
+        let result = round_trip(src);
+        assert_eq!(
+            result, src,
+            "round-trip must preserve all UTF-8 multi-byte characters"
+        );
+    }
+
+    #[test]
+    fn consume_string_literal_stores_utf8_correctly() {
+        // Directly test that the stored original literal is UTF-8, not Latin-1.
+        let src = "String s = \"passé\";";
+        let (_, store) = blank_literals(src);
+        assert_eq!(store.entries.len(), 1);
+        assert_eq!(
+            store.entries[0].original, "\"passé\"",
+            "stored literal must be the original UTF-8 string, not mojibake"
         );
     }
 }
